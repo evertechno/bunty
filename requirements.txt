@@ -1,5 +1,4 @@
 streamlit
-streamlit-webrtc
-pdfminer
-fitzz
-av
+pdfminer.six 
+pymupdf
+pillow
