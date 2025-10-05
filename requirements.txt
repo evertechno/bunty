@@ -2,4 +2,4 @@ streamlit
 pdfminer.six 
 pymupdf
 pillow
-docx
+python-docx
