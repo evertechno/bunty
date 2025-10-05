@@ -3,3 +3,4 @@ pdfminer.six
 pymupdf
 pillow
 python-docx
+bs4
