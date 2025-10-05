@@ -4,3 +4,4 @@ pymupdf
 pillow
 python-docx
 bs4
+pdfplumber
