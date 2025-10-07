@@ -628,4 +628,7 @@ with ThreadPoolExecutor(max_workers=workers) as executor:
         try:
             result = future.result()
             if "error" in result:
-                errors_occurred.appen
+                # Corrected line: You need to call .append() and provide an argument
+                errors_occurred.append(result["error"]) # Assuming result["error"] contains the error details
+        except Exception as e: # It's good practice to catch exceptions from future.result() as well
+            errors_occurred.append(f"Error processing {file_name_processed}: {e}")
