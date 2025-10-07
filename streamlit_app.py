@@ -635,4 +635,4 @@ with ThreadPoolExecutor(max_workers=workers) as executor:
             else:
                 results_for_zip.append(result)
                 conversion_log.write(f"✅ Converted '{result['name']}' to '{result['out_name']}' ({len(result['out_bytes']):,} bytes)")
-        except
+        except:
