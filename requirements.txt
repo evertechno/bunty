@@ -1,7 +1,4 @@
-streamlit
-pdfminer.six 
-pymupdf
+streamlit 
+opencv-python
 pillow
-python-docx
-bs4
-pdfplumber
+numpy
