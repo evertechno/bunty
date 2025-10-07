@@ -205,15 +205,16 @@ if convert_button:
 </body>
 </html>
 """
-            iframe_html = f'<iframe srcdoc="{iframe_srcdoc.replace(\'"\', "&quot;")}" style="width:100%;height:420px;border:1px solid #ddd;border-radius:6px;"></iframe>'
-            st.components.v1.html(iframe_html, height=420)
+           # Escape double quotes safely before embedding in f-string
+safe_srcdoc = iframe_srcdoc.replace('"', "&quot;")
 
-            st.markdown("---")
-            st.write("#### Email embedding notes")
-            st.write(
-                "- Most email clients support animated GIFs via `<img src=\"cid:...\">` (inline attachments) or a public URL. Embedding base64 data URIs in emails **may** be blocked by some clients — attaching the GIF and referencing it by `cid` is the most compatible approach.\n"
-                "- Aim for ≤ 600px width and ≤ ~200–300 KB for wide compatibility. If the GIF is still big: lower FPS, reduce resolution, shorten duration, or crop/unselect frames."
-            )
+iframe_html = (
+    f'<iframe srcdoc="{safe_srcdoc}" '
+    f'style="width:100%;height:420px;border:1px solid #ddd;border-radius:6px;"></iframe>'
+)
+
+st.components.v1.html(iframe_html, height=420)
+
 
     except Exception as e:
         st.error(f"Conversion failed: {e}")
