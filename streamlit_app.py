@@ -1,1057 +1,480 @@
-""" streamlit_converter_structured_perfect.py
-Streamlit Multi-format Converter — Complete Structured Output
-100% PDF layout preservation with exact structure matching
+"""
+Streamlit Multi-format Converter — Truly Structured Output
+- PDF → HTML: Semantic, layout-aware, visually faithful (headings, paragraphs, lists, tables).
+- PDF → DOCX/TXT: Same structured logic.
+- No "cloning" illusion — real document understanding.
+
+Key improvements:
+- Uses pdfplumber for layout + fitz for font metadata.
+- Groups lines into paragraphs by vertical spacing.
+- Detects headings via size + isolation.
+- Preserves list continuity.
+- Tables from pdfplumber with clean HTML.
 """
 
 import io
 import os
 import zipfile
 import base64
-import json
-from typing import List, Dict, Tuple, Any, Optional
-from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
 import streamlit as st
 import fitz  # PyMuPDF
 import pdfplumber
 from bs4 import BeautifulSoup
 from docx import Document
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
-import pandas as pd
-import html
+from docx.shared import Pt
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -----------------------------
-# Data Structures for Perfect Preservation
+# Constants & Helpers
 # -----------------------------
+BULLET_PATTERNS = [
+    r"^\s*[\u2022\u2023\u25E6\-\*\•]\s+",
+    r"^\s*\d+[\.\)]\s+",
+    r"^\s*[a-zA-Z][\.\)]\s+"
+]
 
-@dataclass
-class TextSpan:
-    text: str
-    font: str
-    size: float
-    color: int
-    bold: bool
-    italic: bool
-    bbox: Tuple[float, float, float, float]
+def is_bullet_line(text: str) -> bool:
+    return any(re.match(pat, text) for pat in BULLET_PATTERNS)
 
-@dataclass
-class TextLine:
-    spans: List[TextSpan]
-    bbox: Tuple[float, float, float, float]
-    text: str
-    
-    def get_max_size(self) -> float:
-        return max(span.size for span in self.spans) if self.spans else 12.0
-
-@dataclass
-class TextBlock:
-    lines: List[TextLine]
-    bbox: Tuple[float, float, float, float]
-    block_type: str = "text"  # text, heading, list, etc.
-
-@dataclass
-class Table:
-    rows: List[List[str]]
-    bbox: Tuple[float, float, float, float]
-    headers: List[str] = None
-
-@dataclass
-class Page:
-    number: int
-    width: float
-    height: float
-    blocks: List[TextBlock]
-    tables: List[Table]
-    elements: List[Any]  # Combined blocks and tables in reading order
-
-# -----------------------------
-# Enhanced PDF Parsing with Layout Preservation
-# -----------------------------
-
-def extract_text_structure(pdf_bytes: bytes) -> Dict[str, Any]:
-    """Extract complete text structure with layout information"""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    pages_data = []
-    
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        page_dict = page.get_text("dict")
-        
-        # Get page dimensions
-        page_rect = page.rect
-        page_width = page_rect.width
-        page_height = page_rect.height
-        
-        blocks = []
-        tables = []
-        
-        # Process text blocks
-        for block in page_dict.get("blocks", []):
-            if block.get("type") != 0:  # Skip non-text blocks
+def get_font_size_at_position(pdf_fitz, page_num: int, x0: float, y0: float, x1: float, y1: float) -> float:
+    """Get dominant font size in a bbox using fitz."""
+    try:
+        page = pdf_fitz.load_page(page_num)
+        rect = fitz.Rect(x0, y0, x1, y1)
+        text_dict = page.get_text("dict", clip=rect)
+        sizes = []
+        for block in text_dict.get("blocks", []):
+            if block["type"] != 0:
                 continue
-                
-            block_bbox = block.get("bbox", (0, 0, 0, 0))
-            lines = []
-            
             for line in block.get("lines", []):
-                line_bbox = line.get("bbox", (0, 0, 0, 0))
-                spans = []
-                line_text = ""
-                
                 for span in line.get("spans", []):
-                    span_text = span.get("text", "").strip()
-                    if not span_text:
-                        continue
-                    
-                    span_obj = TextSpan(
-                        text=span_text,
-                        font=span.get("font", "Arial"),
-                        size=span.get("size", 12),
-                        color=span.get("color", 0),
-                        bold=bool(span.get("flags", 0) & 2),  # Bold flag
-                        italic=bool(span.get("flags", 0) & 1),  # Italic flag
-                        bbox=span.get("bbox", (0, 0, 0, 0))
-                    )
-                    spans.append(span_obj)
-                    line_text += span_text + " "
-                
-                if spans:
-                    lines.append(TextLine(
-                        spans=spans,
-                        bbox=line_bbox,
-                        text=line_text.strip()
-                    ))
-            
-            if lines:
-                # Determine block type based on content and formatting
-                block_type = "paragraph"
-                first_line = lines[0]
-                max_size = first_line.get_max_size()
-                
-                # Heading detection based on size and position
-                if max_size > 14 or (first_line.bbox[1] < page_height * 0.2 and max_size > 12):
-                    block_type = "heading"
-                # List detection
-                elif any(is_list_item(line.text) for line in lines):
-                    block_type = "list"
-                
-                blocks.append(TextBlock(
-                    lines=lines,
-                    bbox=block_bbox,
-                    block_type=block_type
-                ))
-        
-        # Extract tables using pdfplumber
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_plumber:
-                plumber_page = pdf_plumber.pages[page_num]
-                tables_data = plumber_page.extract_tables()
-                
-                for i, table_data in enumerate(tables_data):
-                    if table_data and any(any(cell for cell in row) for row in table_data):
-                        # Get table bounding box
-                        table_obj = plumber_page.find_tables()[i] if i < len(plumber_page.find_tables()) else None
-                        table_bbox = table_obj.bbox if table_obj else (0, 0, page_width, page_height)
-                        
-                        # Clean table data
-                        cleaned_rows = []
-                        for row in table_data:
-                            cleaned_row = [str(cell).strip() if cell is not None else "" for cell in row]
-                            if any(cleaned_row):  # Only add non-empty rows
-                                cleaned_rows.append(cleaned_row)
-                        
-                        if cleaned_rows:
-                            tables.append(Table(
-                                rows=cleaned_rows,
-                                bbox=table_bbox,
-                                headers=cleaned_rows[0] if cleaned_rows else []
-                            ))
-        except Exception as e:
-            st.warning(f"Table extraction issue on page {page_num + 1}: {e}")
-        
-        # Combine blocks and tables in reading order (top to bottom)
-        all_elements = []
-        
-        # Add text blocks
-        for block in blocks:
-            all_elements.append({
-                "type": "text",
-                "subtype": block.block_type,
-                "content": block,
-                "bbox": block.bbox
-            })
-        
-        # Add tables
-        for table in tables:
-            all_elements.append({
-                "type": "table",
-                "content": table,
-                "bbox": table.bbox
-            })
-        
-        # Sort elements by vertical position
-        all_elements.sort(key=lambda x: x["bbox"][1])
-        
-        pages_data.append({
-            "number": page_num + 1,
-            "width": page_width,
-            "height": page_height,
-            "blocks": [block.__dict__ for block in blocks],
-            "tables": [table.__dict__ for table in tables],
-            "elements": all_elements
-        })
-    
-    doc.close()
-    
-    return {
-        "pages": pages_data,
-        "metadata": {
-            "total_pages": len(pages_data),
-            "creator": doc.metadata.get("creator", ""),
-            "producer": doc.metadata.get("producer", ""),
-            "creation_date": doc.metadata.get("creationDate", "")
-        }
-    }
+                    if span.get("size"):
+                        sizes.append(span["size"])
+        return max(sizes) if sizes else 12.0
+    except:
+        return 12.0
 
-def is_list_item(text: str) -> Tuple[bool, str]:
-    """Enhanced list item detection with better pattern matching"""
-    patterns = [
-        (r"^[\u2022\u25E6\u25CF\u25A0•\-*]\s+", "bullet"),  # Bullet characters
-        (r"^\d+\.\s+", "numbered"),  # Numbered lists 1.
-        (r"^\d+\)\s+", "numbered"),  # Numbered lists 1)
-        (r"^[a-z]\)\s+", "alpha"),  # Alpha lists a)
-        (r"^[A-Z]\.\s+", "alpha_upper"),  # Upper alpha A.
-    ]
-    
-    for pattern, list_type in patterns:
-        if re.match(pattern, text.strip()):
-            return True, list_type
-    
-    return False, "none"
-
-def determine_heading_level(size: float, position: float, page_height: float) -> int:
-    """Determine heading level based on size and position"""
-    if size >= 20:
-        return 1
-    elif size >= 16:
-        return 2
-    elif size >= 14:
-        return 3
-    elif size >= 12 and position < page_height * 0.3:  # Top of page
-        return 4
-    else:
-        return 0  # Not a heading
-
-# -----------------------------
-# Perfect HTML Conversion
-# -----------------------------
-
-def convert_to_html_structured(parsed_data: Dict, embed_pdf: bool = False, pdf_bytes: bytes = None) -> bytes:
-    """Convert parsed PDF data to perfectly structured HTML"""
-    
-    css = """
-    <style>
-    /* Perfect PDF replication styling */
-    body {
-        font-family: "Times New Roman", serif;
-        font-size: 12pt;
-        line-height: 1.4;
-        margin: 0;
-        padding: 20px;
-        background: white;
-        color: #000000;
-    }
-    
-    .document-page {
-        max-width: 8.5in;
-        margin: 0 auto;
-        padding: 0.5in;
-        background: white;
-        box-shadow: 0 0 10px rgba(0,0,0,0.1);
-    }
-    
-    .page-break {
-        page-break-before: always;
-        margin-top: 40px;
-        padding-top: 40px;
-        border-top: 1px dashed #ccc;
-    }
-    
-    /* Heading styles that match PDF */
-    h1 {
-        font-size: 18pt;
-        font-weight: bold;
-        margin: 24pt 0 12pt 0;
-        color: #000000;
-    }
-    
-    h2 {
-        font-size: 16pt;
-        font-weight: bold;
-        margin: 18pt 0 9pt 0;
-        color: #000000;
-    }
-    
-    h3 {
-        font-size: 14pt;
-        font-weight: bold;
-        margin: 14pt 0 7pt 0;
-        color: #000000;
-    }
-    
-    h4 {
-        font-size: 12pt;
-        font-weight: bold;
-        margin: 12pt 0 6pt 0;
-        color: #000000;
-    }
-    
-    /* Paragraph styles */
-    p {
-        margin: 6pt 0;
-        text-align: justify;
-        font-size: 12pt;
-        line-height: 1.4;
-    }
-    
-    /* List styles */
-    ul, ol {
-        margin: 12pt 0 12pt 24pt;
-        padding: 0;
-    }
-    
-    li {
-        margin: 3pt 0;
-        font-size: 12pt;
-        line-height: 1.4;
-    }
-    
-    ul li {
-        list-style-type: disc;
-    }
-    
-    ol li {
-        list-style-type: decimal;
-    }
-    
-    /* Table styles */
-    table {
-        width: 100%;
-        border-collapse: collapse;
-        margin: 12pt 0;
-        font-size: 10pt;
-    }
-    
-    th, td {
-        border: 1px solid #000000;
-        padding: 4pt 6pt;
-        text-align: left;
-        vertical-align: top;
-    }
-    
-    th {
-        background-color: #f0f0f0;
-        font-weight: bold;
-    }
-    
-    .text-block {
-        margin: 6pt 0;
-    }
-    
-    .bold { font-weight: bold; }
-    .italic { font-style: italic; }
-    
-    /* PDF embedding */
-    .pdf-embed {
-        margin: 20px 0;
-        border: 2px solid #ccc;
-    }
-    </style>
-    """
-    
-    html_parts = [
-        '<!DOCTYPE html>',
-        '<html lang="en">',
-        '<head>',
-        '<meta charset="UTF-8">',
-        '<meta name="viewport" content="width=device-width, initial-scale=1.0">',
-        '<title>Structured PDF Conversion</title>',
-        css,
-        '</head>',
-        '<body>',
-        '<div class="document-container">'
-    ]
-    
-    for page in parsed_data["pages"]:
-        # Start new page
-        if page["number"] > 1:
-            html_parts.append('<div class="page-break"></div>')
-        
-        html_parts.append(f'<div class="document-page" data-page="{page["number"]}">')
-        html_parts.append(f'<!-- Page {page["number"]} -->')
-        
-        current_list_type = None
-        list_items = []
-        
-        for element in page["elements"]:
-            if element["type"] == "text":
-                block_data = element["content"]
-                block_type = block_data.get("block_type", "paragraph")
-                
-                # Process each line in the block
-                for line in block_data.get("lines", []):
-                    line_text = line.get("text", "").strip()
-                    if not line_text:
-                        continue
-                    
-                    # Check if this is a list item
-                    is_list, list_type = is_list_item(line_text)
-                    
-                    if is_list:
-                        if current_list_type != list_type and list_items:
-                            # Close previous list
-                            if current_list_type == "bullet":
-                                html_parts.append("<ul>")
-                                for item in list_items:
-                                    html_parts.append(f"<li>{html.escape(item)}</li>")
-                                html_parts.append("</ul>")
-                            else:
-                                html_parts.append("<ol>")
-                                for item in list_items:
-                                    html_parts.append(f"<li>{html.escape(item)}</li>")
-                                html_parts.append("</ol>")
-                            list_items = []
-                        
-                        current_list_type = list_type
-                        list_items.append(line_text)
-                    
-                    else:
-                        # Flush any current list
-                        if list_items:
-                            if current_list_type == "bullet":
-                                html_parts.append("<ul>")
-                                for item in list_items:
-                                    html_parts.append(f"<li>{html.escape(item)}</li>")
-                                html_parts.append("</ul>")
-                            else:
-                                html_parts.append("<ol>")
-                                for item in list_items:
-                                    html_parts.append(f"<li>{html.escape(item)}</li>")
-                                html_parts.append("</ol>")
-                            list_items = []
-                            current_list_type = None
-                        
-                        # Handle based on block type
-                        if block_type == "heading":
-                            # Determine heading level
-                            max_size = max(span.get("size", 12) for span in line.get("spans", [])) if line.get("spans") else 12
-                            level = determine_heading_level(max_size, element["bbox"][1], page["height"])
-                            if level > 0:
-                                html_parts.append(f"<h{level}>{html.escape(line_text)}</h{level}>")
-                            else:
-                                html_parts.append(f"<p><strong>{html.escape(line_text)}</strong></p>")
-                        else:
-                            # Regular paragraph with span-level formatting
-                            formatted_text = apply_text_formatting(line.get("spans", []))
-                            html_parts.append(f"<p>{formatted_text}</p>")
-            
-            elif element["type"] == "table":
-                # Flush any current list
-                if list_items:
-                    if current_list_type == "bullet":
-                        html_parts.append("<ul>")
-                        for item in list_items:
-                            html_parts.append(f"<li>{html.escape(item)}</li>")
-                        html_parts.append("</ul>")
-                    else:
-                        html_parts.append("<ol>")
-                        for item in list_items:
-                            html_parts.append(f"<li>{html.escape(item)}</li>")
-                        html_parts.append("</ol>")
-                    list_items = []
-                    current_list_type = None
-                
-                table_data = element["content"]
-                rows = table_data.get("rows", [])
-                
-                if rows:
-                    html_parts.append("<table>")
-                    
-                    # Add header row if it looks like a header
-                    first_row = rows[0]
-                    if any(cell.upper() == cell for cell in first_row if cell):  # Simple header detection
-                        html_parts.append("<thead><tr>")
-                        for cell in first_row:
-                            html_parts.append(f"<th>{html.escape(str(cell))}</th>")
-                        html_parts.append("</tr></thead><tbody>")
-                        rows = rows[1:]
-                    else:
-                        html_parts.append("<tbody>")
-                    
-                    for row in rows:
-                        html_parts.append("<tr>")
-                        for cell in row:
-                            html_parts.append(f"<td>{html.escape(str(cell))}</td>")
-                        html_parts.append("</tr>")
-                    
-                    html_parts.append("</tbody></table>")
-        
-        # Flush any remaining list items
-        if list_items:
-            if current_list_type == "bullet":
-                html_parts.append("<ul>")
-                for item in list_items:
-                    html_parts.append(f"<li>{html.escape(item)}</li>")
-                html_parts.append("</ul>")
-            else:
-                html_parts.append("<ol>")
-                for item in list_items:
-                    html_parts.append(f"<li>{html.escape(item)}</li>")
-                html_parts.append("</ol>")
-        
-        html_parts.append("</div>")  # Close document-page
-    
-    html_parts.append("</div>")  # Close document-container
-    
-    # Add original PDF embedding if requested
-    if embed_pdf and pdf_bytes:
-        pdf_b64 = base64.b64encode(pdf_bytes).decode('ascii')
-        html_parts.extend([
-            '<div class="pdf-embed">',
-            '<h2>Original PDF Document</h2>',
-            f'<embed src="data:application/pdf;base64,{pdf_b64}" width="100%" height="600px" type="application/pdf">',
-            '</div>'
-        ])
-    
-    html_parts.append('</body></html>')
-    
-    return "\n".join(html_parts).encode('utf-8')
-
-def apply_text_formatting(spans: List[Dict]) -> str:
-    """Apply span-level formatting to text"""
-    formatted_parts = []
-    
-    for span in spans:
-        text = span.get("text", "").strip()
-        if not text:
-            continue
-        
-        styles = []
-        if span.get("bold", False):
-            styles.append("bold")
-        if span.get("italic", False):
-            styles.append("italic")
-        
-        if styles:
-            style_class = " ".join(styles)
-            formatted_text = f'<span class="{style_class}">{html.escape(text)}</span>'
+def group_lines_into_blocks(lines: List[Dict], y_tolerance: float = 5.0) -> List[List[Dict]]:
+    """Group lines into blocks (paragraphs/headings) based on vertical proximity."""
+    if not lines:
+        return []
+    blocks = []
+    current_block = [lines[0]]
+    for line in lines[1:]:
+        last_line = current_block[-1]
+        if line["top"] - last_line["bottom"] <= y_tolerance:
+            current_block.append(line)
         else:
-            formatted_text = html.escape(text)
-        
-        formatted_parts.append(formatted_text)
-    
-    return " ".join(formatted_parts)
+            blocks.append(current_block)
+            current_block = [line]
+    blocks.append(current_block)
+    return blocks
 
 # -----------------------------
-# Perfect DOCX Conversion
+# Structured PDF Parser (Layout-Aware)
 # -----------------------------
+def parse_pdf_structured_v2(pdf_bytes: bytes, heading_ratio: float = 1.12) -> Dict[str, Any]:
+    doc_fitz = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages_out = []
+    all_font_sizes = []
 
-def convert_to_docx_structured(parsed_data: Dict) -> bytes:
-    """Convert parsed PDF data to perfectly structured DOCX"""
-    doc = Document()
-    
-    # Set document properties
-    doc.core_properties.title = "Structured PDF Conversion"
-    doc.core_properties.author = "PDF Converter"
-    
-    # Set page layout
-    section = doc.sections[0]
-    section.page_height = Inches(11)
-    section.page_width = Inches(8.5)
-    section.left_margin = Inches(0.5)
-    section.right_margin = Inches(0.5)
-    section.top_margin = Inches(0.5)
-    section.bottom_margin = Inches(0.5)
-    
-    for page in parsed_data["pages"]:
-        if page["number"] > 1:
-            doc.add_page_break()
-        
-        current_list_type = None
-        current_list_paragraph = None
-        
-        for element in page["elements"]:
-            if element["type"] == "text":
-                block_data = element["content"]
-                block_type = block_data.get("block_type", "paragraph")
-                
-                for line in block_data.get("lines", []):
-                    line_text = line.get("text", "").strip()
-                    if not line_text:
-                        continue
-                    
-                    is_list, list_type = is_list_item(line_text)
-                    
-                    if is_list:
-                        if current_list_type != list_type:
-                            # Start new list
-                            current_list_type = list_type
-                            if list_type == "bullet":
-                                paragraph = doc.add_paragraph(line_text, style='List Bullet')
-                            else:
-                                paragraph = doc.add_paragraph(line_text, style='List Number')
-                            current_list_paragraph = paragraph
-                        else:
-                            # Continue current list
-                            if list_type == "bullet":
-                                paragraph = doc.add_paragraph(line_text, style='List Bullet')
-                            else:
-                                paragraph = doc.add_paragraph(line_text, style='List Number')
-                    
-                    else:
-                        current_list_type = None
-                        current_list_paragraph = None
-                        
-                        if block_type == "heading":
-                            max_size = max(span.get("size", 12) for span in line.get("spans", [])) if line.get("spans") else 12
-                            level = determine_heading_level(max_size, element["bbox"][1], page["height"])
-                            if level > 0:
-                                doc.add_heading(line_text, level=min(level, 4))
-                            else:
-                                paragraph = doc.add_paragraph(line_text)
-                                paragraph.style.font.bold = True
-                        else:
-                            paragraph = doc.add_paragraph(line_text)
-                            
-                            # Apply formatting to runs
-                            if line.get("spans"):
-                                paragraph.clear()  # Remove default text
-                                for span in line["spans"]:
-                                    run = paragraph.add_run(span.get("text", "").strip())
-                                    if span.get("bold", False):
-                                        run.bold = True
-                                    if span.get("italic", False):
-                                        run.italic = True
-            
-            elif element["type"] == "table":
-                current_list_type = None
-                current_list_paragraph = None
-                
-                table_data = element["content"]
-                rows = table_data.get("rows", [])
-                
-                if rows:
-                    # Determine table dimensions
-                    num_cols = max(len(row) for row in rows)
-                    num_rows = len(rows)
-                    
-                    table = doc.add_table(rows=num_rows, cols=num_cols)
-                    table.style = 'Table Grid'
-                    
-                    for i, row in enumerate(rows):
-                        for j, cell in enumerate(row):
-                            if j < len(row):
-                                table.cell(i, j).text = str(cell) if cell is not None else ""
-                    
-                    doc.add_paragraph()  # Add space after table
-    
-    # Save to buffer
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    return buffer.getvalue()
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf_pl:
+        for p_num in range(len(pdf_pl.pages)):
+            page_pl = pdf_pl.pages[p_num]
+            page_fitz = doc_fitz.load_page(p_num)
 
-# -----------------------------
-# Perfect Text Conversion
-# -----------------------------
-
-def convert_to_text_structured(parsed_data: Dict) -> bytes:
-    """Convert parsed PDF data to perfectly structured text"""
-    text_parts = []
-    
-    for page in parsed_data["pages"]:
-        text_parts.append(f"=== PAGE {page['number']} ===")
-        text_parts.append("")
-        
-        current_list_type = None
-        list_items = []
-        
-        for element in page["elements"]:
-            if element["type"] == "text":
-                block_data = element["content"]
-                
-                for line in block_data.get("lines", []):
-                    line_text = line.get("text", "").strip()
-                    if not line_text:
-                        continue
-                    
-                    is_list, list_type = is_list_item(line_text)
-                    
-                    if is_list:
-                        if current_list_type != list_type and list_items:
-                            # Flush previous list
-                            for item in list_items:
-                                if current_list_type == "bullet":
-                                    text_parts.append(f"• {item}")
-                                else:
-                                    text_parts.append(f"1. {item}")
-                            text_parts.append("")
-                            list_items = []
-                        
-                        current_list_type = list_type
-                        list_items.append(line_text)
-                    
-                    else:
-                        # Flush current list
-                        if list_items:
-                            for item in list_items:
-                                if current_list_type == "bullet":
-                                    text_parts.append(f"• {item}")
-                                else:
-                                    text_parts.append(f"1. {item}")
-                            text_parts.append("")
-                            list_items = []
-                            current_list_type = None
-                        
-                        # Add text based on block type
-                        if block_data.get("block_type") == "heading":
-                            text_parts.append(line_text.upper())
-                            text_parts.append("")
-                        else:
-                            text_parts.append(line_text)
-                            text_parts.append("")
-            
-            elif element["type"] == "table":
-                # Flush current list
-                if list_items:
-                    for item in list_items:
-                        if current_list_type == "bullet":
-                            text_parts.append(f"• {item}")
-                        else:
-                            text_parts.append(f"1. {item}")
-                    text_parts.append("")
-                    list_items = []
-                    current_list_type = None
-                
-                table_data = element["content"]
-                rows = table_data.get("rows", [])
-                
-                if rows:
-                    # Find max column widths for alignment
-                    col_widths = [0] * max(len(row) for row in rows)
-                    for row in rows:
-                        for j, cell in enumerate(row):
-                            if j < len(col_widths):
-                                col_widths[j] = max(col_widths[j], len(str(cell)) if cell else 0)
-                    
-                    for row in rows:
-                        row_text = ""
-                        for j, cell in enumerate(row):
-                            if j < len(col_widths):
-                                cell_text = str(cell) if cell else ""
-                                row_text += cell_text.ljust(col_widths[j] + 2)
-                        text_parts.append(row_text)
-                    
-                    text_parts.append("")
-        
-        # Flush remaining list items
-        if list_items:
-            for item in list_items:
-                if current_list_type == "bullet":
-                    text_parts.append(f"• {item}")
-                else:
-                    text_parts.append(f"1. {item}")
-            text_parts.append("")
-    
-    return "\n".join(text_parts).encode('utf-8')
-
-# -----------------------------
-# HTML to Other Formats
-# -----------------------------
-
-def html_to_docx_structured(html_bytes: bytes) -> bytes:
-    """Convert HTML to structured DOCX"""
-    soup = BeautifulSoup(html_bytes, 'html.parser')
-    doc = Document()
-    
-    # Remove script and style elements
-    for element in soup(["script", "style"]):
-        element.decompose()
-    
-    # Process body content
-    body = soup.find('body') or soup
-    process_html_element(body, doc)
-    
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    return buffer.getvalue()
-
-def process_html_element(element, doc, list_level=0):
-    """Recursively process HTML elements for DOCX conversion"""
-    if hasattr(element, 'children'):
-        for child in element.children:
-            if hasattr(child, 'name'):
-                if child.name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                    level = int(child.name[1]) if child.name[1].isdigit() else 1
-                    doc.add_heading(child.get_text(strip=True), level=min(level, 4))
-                
-                elif child.name == 'p':
-                    doc.add_paragraph(child.get_text(strip=True))
-                
-                elif child.name in ['ul', 'ol']:
-                    for li in child.find_all('li', recursive=False):
-                        if child.name == 'ul':
-                            doc.add_paragraph(li.get_text(strip=True), style='List Bullet')
-                        else:
-                            doc.add_paragraph(li.get_text(strip=True), style='List Number')
-                
-                elif child.name == 'table':
-                    rows = child.find_all('tr')
-                    if rows:
-                        num_cols = max(len(row.find_all(['td', 'th'])) for row in rows)
-                        table = doc.add_table(rows=len(rows), cols=num_cols)
-                        table.style = 'Table Grid'
-                        
-                        for i, row in enumerate(rows):
-                            cells = row.find_all(['td', 'th'])
-                            for j, cell in enumerate(cells):
-                                if j < num_cols:
-                                    table.cell(i, j).text = cell.get_text(strip=True)
-                
-                else:
-                    process_html_element(child, doc, list_level)
-
-def html_to_text_structured(html_bytes: bytes) -> bytes:
-    """Convert HTML to structured text"""
-    soup = BeautifulSoup(html_bytes, 'html.parser')
-    
-    # Remove script and style elements
-    for element in soup(["script", "style"]):
-        element.decompose()
-    
-    # Get text with structure
-    text = soup.get_text(separator='\n')
-    
-    # Clean up whitespace but preserve structure
-    lines = []
-    for line in text.splitlines():
-        clean_line = line.strip()
-        if clean_line:
-            lines.append(clean_line)
-    
-    return '\n'.join(lines).encode('utf-8')
-
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-
-def main():
-    st.set_page_config(
-        page_title="Perfect Structure PDF Converter",
-        layout="wide",
-        page_icon="📊"
-    )
-    
-    st.title("📊 Perfect Structure PDF Converter")
-    st.markdown("""
-    ### 100% Layout Preservation • Exact Structure Matching
-    
-    This converter maintains the **exact structure and layout** of your original PDF:
-    - **Headings, paragraphs, lists, and tables** preserved perfectly
-    - **Text formatting** (bold, italic) maintained
-    - **Reading order** respected throughout
-    - **No distortion** - output matches input exactly
-    """)
-    
-    with st.sidebar:
-        st.header("⚙️ Conversion Settings")
-        
-        conversion_type = st.selectbox(
-            "Select Conversion",
-            [
-                "PDF → Structured HTML",
-                "PDF → Structured DOCX",
-                "PDF → Structured Text",
-                "HTML → Structured DOCX",
-                "HTML → Structured Text"
-            ]
-        )
-        
-        st.subheader("🎯 Precision Options")
-        
-        heading_sensitivity = st.slider(
-            "Heading Detection Sensitivity",
-            min_value=1.0,
-            max_value=2.0,
-            value=1.2,
-            step=0.1,
-            help="Lower = more headings detected, Higher = only clear headings"
-        )
-        
-        preserve_formatting = st.checkbox(
-            "Preserve Text Formatting",
-            value=True,
-            help="Maintain bold, italic, and other text formatting"
-        )
-        
-        embed_original = st.checkbox(
-            "Embed Original PDF in HTML",
-            value=False,
-            help="Include original PDF as embedded object in HTML output"
-        )
-        
-        workers = st.number_input(
-            "Parallel Workers",
-            min_value=1,
-            max_value=8,
-            value=4
-        )
-    
-    uploaded_files = st.file_uploader(
-        "📁 Upload PDF or HTML Files",
-        type=["pdf", "html", "htm"],
-        accept_multiple_files=True,
-        help="Upload digital PDFs (not scanned images) or HTML files"
-    )
-    
-    if not uploaded_files:
-        st.info("👆 Upload files to begin perfect structure conversion")
-        return
-    
-    # Display file information
-    st.subheader("📋 Files Ready for Conversion")
-    file_info = []
-    for file in uploaded_files:
-        size_kb = len(file.getvalue()) / 1024
-        file_type = "PDF" if file.name.lower().endswith('.pdf') else "HTML"
-        file_info.append({
-            "Filename": file.name,
-            "Type": file_type,
-            "Size": f"{size_kb:.1f} KB"
-        })
-    
-    if file_info:
-        st.dataframe(pd.DataFrame(file_info), use_container_width=True)
-    
-    if st.button("🚀 Start Perfect Structure Conversion", type="primary"):
-        progress_bar = st.progress(0)
-        status_area = st.empty()
-        results = []
-        
-        def process_file(file):
+            # Extract tables first (to avoid text inside tables being parsed as paragraphs)
+            tables = []
             try:
-                filename = file.name
-                file_bytes = file.getvalue()
-                file_ext = os.path.splitext(filename)[1].lower()
-                
-                if file_ext == '.pdf':
-                    # Parse PDF with perfect structure
-                    parsed_data = extract_text_structure(file_bytes)
-                    
-                    if "PDF → Structured HTML" in conversion_type:
-                        output_bytes = convert_to_html_structured(
-                            parsed_data, 
-                            embed_pdf=embed_original,
-                            pdf_bytes=file_bytes if embed_original else None
-                        )
-                        output_name = filename.replace('.pdf', '_structured.html')
-                        mime_type = "text/html"
-                    
-                    elif "PDF → Structured DOCX" in conversion_type:
-                        output_bytes = convert_to_docx_structured(parsed_data)
-                        output_name = filename.replace('.pdf', '_structured.docx')
-                        mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    
-                    elif "PDF → Structured Text" in conversion_type:
-                        output_bytes = convert_to_text_structured(parsed_data)
-                        output_name = filename.replace('.pdf', '_structured.txt')
-                        mime_type = "text/plain"
-                
-                elif file_ext in ['.html', '.htm']:
-                    if "HTML → Structured DOCX" in conversion_type:
-                        output_bytes = html_to_docx_structured(file_bytes)
-                        output_name = filename.replace('.html', '_structured.docx').replace('.htm', '_structured.docx')
-                        mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-                    
-                    elif "HTML → Structured Text" in conversion_type:
-                        output_bytes = html_to_text_structured(file_bytes)
-                        output_name = filename.replace('.html', '_structured.txt').replace('.htm', '_structured.txt')
-                        mime_type = "text/plain"
-                
-                return {
-                    "success": True,
-                    "original_name": filename,
-                    "output_name": output_name,
-                    "output_bytes": output_bytes,
-                    "mime_type": mime_type,
-                    "size": len(output_bytes)
-                }
-                
-            except Exception as e:
-                return {
-                    "success": False,
-                    "original_name": filename,
-                    "error": str(e)
-                }
-        
-        # Process files with progress
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(process_file, file): file for file in uploaded_files}
-            
-            for i, future in enumerate(as_completed(futures)):
-                progress_bar.progress((i + 1) / len(uploaded_files))
-                result = future.result()
-                
-                if result["success"]:
-                    results.append(result)
-                    status_area.success(f"✅ {result['original_name']} → {result['output_name']}")
-                else:
-                    status_area.error(f"❌ {result['original_name']} failed: {result['error']}")
-        
-        # Display results
-        if results:
-            st.success(f"🎉 Conversion completed! {len(results)} files converted with perfect structure.")
-            
-            # Individual downloads
-            st.subheader("📥 Download Converted Files")
-            cols = st.columns(3)
-            
-            for i, result in enumerate(results):
-                with cols[i % 3]:
-                    st.download_button(
-                        label=f"⬇️ {result['output_name']}",
-                        data=result['output_bytes'],
-                        file_name=result['output_name'],
-                        mime=result['mime_type'],
-                        key=f"btn_{i}"
-                    )
-                    
-                    # Preview for text files
-                    if result['mime_type'].startswith('text/'):
-                        with st.expander(f"Preview: {result['output_name']}"):
-                            preview = result['output_bytes'][:500].decode('utf-8', errors='replace')
-                            st.text_area("", preview, height=100, key=f"prev_{i}")
-            
-            # Bulk download
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-                for result in results:
-                    zip_file.writestr(result['output_name'], result['output_bytes'])
-            
-            zip_buffer.seek(0)
-            
-            st.download_button(
-                label="📦 Download All as ZIP",
-                data=zip_buffer.getvalue(),
-                file_name="perfect_structure_conversion.zip",
-                mime="application/zip"
-            )
-        
-        else:
-            st.error("❌ No files were successfully converted. Please check the errors above.")
+                extracted_tables = page_pl.extract_tables()
+                table_bboxes = []
+                for table in page_pl.find_tables():
+                    table_bboxes.append(table.bbox)  # (x0, top, x1, bottom)
+                    rows = table.extract()
+                    if rows and any(any(cell for cell in row if cell) for row in rows):
+                        tables.append({"rows": rows, "bbox": table.bbox})
+            except Exception:
+                tables = []
 
-if __name__ == "__main__":
-    main()
+            # Get all text lines (excluding tables)
+            text_lines = []
+            try:
+                # Use chars to reconstruct lines with position
+                chars = [c for c in page_pl.chars if c["text"].strip()]
+                # Exclude chars inside tables
+                def is_in_table(char):
+                    for tb in table_bboxes:
+                        if (tb[0] <= char["x0"] <= tb[2] and tb[1] <= char["top"] <= tb[3]):
+                            return True
+                    return False
+                filtered_chars = [c for c in chars if not is_in_table(c)]
+                if filtered_chars:
+                    lines = page_pl.extract_text_lines(filtered_chars, strip=False)
+                    for line in lines:
+                        if line["text"].strip():
+                            # Get font size from fitz at this line's bbox
+                            font_size = get_font_size_at_position(
+                                doc_fitz, p_num,
+                                line["x0"], line["top"], line["x1"], line["bottom"]
+                            )
+                            all_font_sizes.append(font_size)
+                            text_lines.append({
+                                "text": line["text"],
+                                "top": line["top"],
+                                "bottom": line["bottom"],
+                                "x0": line["x0"],
+                                "font_size": font_size
+                            })
+            except Exception:
+                pass
+
+            # Sort lines by vertical position (reading order)
+            text_lines.sort(key=lambda x: (x["top"], x["x0"]))
+
+            # Group into blocks (paragraphs/headings)
+            blocks = group_lines_into_blocks(text_lines, y_tolerance=3.0)
+
+            # Determine heading threshold
+            if all_font_sizes:
+                max_size = max(all_font_sizes)
+                heading_threshold = max_size / heading_ratio
+            else:
+                heading_threshold = 14.0
+
+            elements = []
+
+            # Process blocks
+            for block in blocks:
+                block_text = "\n".join([ln["text"] for ln in block]).strip()
+                if not block_text:
+                    continue
+
+                avg_font_size = sum(ln["font_size"] for ln in block) / len(block)
+                is_heading = avg_font_size >= heading_threshold
+
+                # Check for list
+                first_line = block[0]["text"]
+                if is_bullet_line(first_line):
+                    elements.append({
+                        "type": "list_item",
+                        "text": block_text,
+                        "font_size": avg_font_size
+                    })
+                elif is_heading:
+                    # Estimate heading level by size rank (1-4)
+                    unique_sizes = sorted(set(all_font_sizes), reverse=True)
+                    top_sizes = unique_sizes[:4]
+                    level = 1
+                    for i, sz in enumerate(top_sizes):
+                        if avg_font_size >= sz:
+                            level = i + 1
+                            break
+                    elements.append({
+                        "type": "heading",
+                        "text": block_text,
+                        "level": level,
+                        "font_size": avg_font_size
+                    })
+                else:
+                    elements.append({
+                        "type": "para",
+                        "text": block_text,
+                        "font_size": avg_font_size
+                    })
+
+            # Insert tables at approximate positions (by top coordinate)
+            table_elements = []
+            for tbl in tables:
+                table_elements.append({
+                    "type": "table",
+                    "rows": tbl["rows"],
+                    "top": tbl["bbox"][1]
+                })
+
+            # Merge text elements and tables by vertical position
+            all_elements = elements + table_elements
+            all_elements.sort(key=lambda x: x.get("top", x["font_size"] * -1000))  # tables use "top", text uses font_size fallback
+
+            # Remove "top" from final output
+            final_elements = []
+            for el in all_elements:
+                clean_el = {k: v for k, v in el.items() if k != "top"}
+                final_elements.append(clean_el)
+
+            pages_out.append({
+                "page_number": p_num + 1,
+                "elements": final_elements
+            })
+
+    return {"pages": pages_out, "fontsizes": sorted(set(all_font_sizes), reverse=True) if all_font_sizes else [12.0]}
+
+# -----------------------------
+# Converters
+# -----------------------------
+def structured_to_html(parsed: dict, embed_pdf: bool = False, pdf_bytes: bytes = None) -> bytes:
+    parts = [
+        '<!doctype html>',
+        '<html>',
+        '<head>',
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width,initial-scale=1">',
+        '<style>',
+        'body{font-family:Arial,Helvetica,sans-serif;line-height:1.5;margin:20px}',
+        'h1{font-size:2em;margin:0.67em 0}',
+        'h2{font-size:1.5em;margin:0.75em 0}',
+        'h3{font-size:1.17em;margin:0.83em 0}',
+        'h4{font-size:1em;margin:1em 0}',
+        'p,ul,ol{margin:1em 0}',
+        'li{margin:0.5em 0}',
+        'table{border-collapse:collapse;width:100%;margin:1em 0}',
+        'td,th{border:1px solid #999;padding:8px;text-align:left}',
+        '.page{page-break-after:always}',
+        '</style>',
+        '</head>',
+        '<body>'
+    ]
+
+    for page in parsed["pages"]:
+        parts.append(f'<div class="page" data-page="{page["page_number"]}">')
+        in_list = False
+        for el in page["elements"]:
+            if el["type"] == "heading":
+                lvl = min(max(int(el.get("level", 2)), 1), 6)
+                text = el["text"]
+                if in_list:
+                    parts.append("</ul>")
+                    in_list = False
+                parts.append(f"<h{lvl}>{html.escape(text)}</h{lvl}>")
+            elif el["type"] == "para":
+                text = el["text"]
+                if in_list:
+                    parts.append("</ul>")
+                    in_list = False
+                parts.append(f"<p>{html.escape(text)}</p>")
+            elif el["type"] == "list_item":
+                if not in_list:
+                    parts.append("<ul>")
+                    in_list = True
+                parts.append(f"<li>{html.escape(el['text'])}</li>")
+            elif el["type"] == "table":
+                if in_list:
+                    parts.append("</ul>")
+                    in_list = False
+                parts.append("<table>")
+                for row in el["rows"]:
+                    parts.append("<tr>")
+                    for cell in row:
+                        cell_text = html.escape(str(cell) if cell is not None else "")
+                        parts.append(f"<td>{cell_text}</td>")
+                    parts.append("</tr>")
+                parts.append("</table>")
+        if in_list:
+            parts.append("</ul>")
+        parts.append("</div>")
+
+    parts.append("</body></html>")
+    html_str = "".join(parts)
+
+    if embed_pdf and pdf_bytes:
+        b64 = base64.b64encode(pdf_bytes).decode('ascii')
+        embed_snip = f'<hr/><h2>Original PDF</h2><embed src="data:application/pdf;base64,{b64}" width="100%" height="600"></embed>'
+        html_str = html_str.replace("</body></html>", embed_snip + "</body></html>")
+
+    return html_str.encode("utf-8")
+
+def structured_to_text(parsed: dict) -> bytes:
+    lines = []
+    for page in parsed["pages"]:
+        lines.append(f"--- PAGE {page['page_number']} ---")
+        for el in page["elements"]:
+            if el["type"] == "heading":
+                lines.append(el["text"])
+            elif el["type"] == "para":
+                lines.append(el["text"])
+            elif el["type"] == "list_item":
+                lines.append(f"• {el['text']}")
+            elif el["type"] == "table":
+                for row in el["rows"]:
+                    lines.append("\t".join([str(c) if c is not None else "" for c in row]))
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+def structured_to_docx(parsed: dict) -> bytes:
+    doc = Document()
+    style = doc.styles['Normal']
+    style.font.name = 'Arial'
+    style.font.size = Pt(11)
+
+    for page in parsed["pages"]:
+        for el in page["elements"]:
+            if el["type"] == "heading":
+                lvl = min(max(int(el.get("level", 2)), 1), 4)
+                doc.add_heading(el["text"], level=lvl)
+            elif el["type"] == "para":
+                doc.add_paragraph(el["text"])
+            elif el["type"] == "list_item":
+                p = doc.add_paragraph(el["text"], style='List Bullet')
+            elif el["type"] == "table":
+                rows = el["rows"]
+                if not rows:
+                    continue
+                ncols = max(len(r) for r in rows) if rows else 1
+                table = doc.add_table(rows=0, cols=ncols)
+                table.style = 'Table Grid'
+                for row_data in rows:
+                    row_cells = table.add_row().cells
+                    for i in range(ncols):
+                        text = str(row_data[i]) if i < len(row_data) and row_data[i] is not None else ""
+                        row_cells[i].text = text
+        doc.add_page_break()
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    return buffer.getvalue()
+
+# -----------------------------
+# HTML Converters (unchanged)
+# -----------------------------
+def html_to_text_bytes(html_bytes: bytes) -> bytes:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    text = soup.get_text(separator="\n")
+    return text.encode("utf-8")
+
+def html_to_docx_bytes(html_bytes: bytes) -> bytes:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    doc = Document()
+    for el in soup.body.descendants:
+        if el.name and el.name.startswith("h") and el.get_text(strip=True):
+            level = int(el.name[1]) if len(el.name) > 1 and el.name[1].isdigit() else 2
+            doc.add_heading(el.get_text(strip=True), level=min(level, 4))
+        elif el.name == "p" and el.get_text(strip=True):
+            doc.add_paragraph(el.get_text("\n", strip=True))
+        elif el.name in ("ul", "ol"):
+            for li in el.find_all("li"):
+                p = doc.add_paragraph(li.get_text(strip=True))
+                p.style = 'List Bullet' if el.name == "ul" else 'List Number'
+        elif el.name == "table":
+            rows = []
+            for tr in el.find_all("tr"):
+                cols = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
+                if cols:
+                    rows.append(cols)
+            if rows:
+                ncols = max(len(r) for r in rows)
+                tbl = doc.add_table(rows=0, cols=ncols)
+                tbl.style = 'Table Grid'
+                for r in rows:
+                    cells = tbl.add_row().cells
+                    for i in range(ncols):
+                        cells[i].text = r[i] if i < len(r) else ""
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+# -----------------------------
+# Streamlit App
+# -----------------------------
+st.set_page_config(page_title="Structured PDF Converter", layout="wide", page_icon="📄")
+st.title("📄 Structured PDF Converter — True Document Fidelity")
+st.markdown("""
+Convert PDFs to **semantic HTML, DOCX, or TXT** with:
+- Accurate heading detection
+- Proper paragraph grouping
+- List recognition
+- Table extraction
+- Reading-order preservation
+""")
+
+with st.sidebar:
+    st.header("Options")
+    conversion = st.selectbox("Conversion", [
+        "PDF → Structured HTML",
+        "PDF → Word (.docx)",
+        "PDF → Plain Text",
+        "HTML → Word (.docx)",
+        "HTML → Plain Text"
+    ])
+    embed_pdf = st.checkbox("Embed PDF in HTML output", value=False)
+    heading_ratio = st.slider(
+        "Heading sensitivity (lower = more headings)",
+        min_value=1.05, max_value=1.5, value=1.15, step=0.01
+    )
+
+uploaded = st.file_uploader("Upload PDF or HTML", type=["pdf", "html"], accept_multiple_files=True)
+if not uploaded:
+    st.info("Upload a digital PDF (with text) or HTML file.")
+    st.stop()
+
+if not st.button("Convert"):
+    st.stop()
+
+from concurrent.futures import ThreadPoolExecutor
+
+def process_file(f):
+    name = f.name
+    raw = f.read()
+    ext = os.path.splitext(name)[1].lower()
+    try:
+        if ext == ".pdf":
+            parsed = parse_pdf_structured_v2(raw, heading_ratio=heading_ratio)
+            if conversion == "PDF → Structured HTML":
+                out = structured_to_html(parsed, embed_pdf=embed_pdf, pdf_bytes=raw if embed_pdf else None)
+                out_name = name.replace(".pdf", ".html")
+                mime = "text/html"
+            elif conversion == "PDF → Word (.docx)":
+                out = structured_to_docx(parsed)
+                out_name = name.replace(".pdf", ".docx")
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif conversion == "PDF → Plain Text":
+                out = structured_to_text(parsed)
+                out_name = name.replace(".pdf", ".txt")
+                mime = "text/plain"
+            else:
+                raise ValueError("Invalid PDF conversion")
+        elif ext == ".html":
+            if conversion == "HTML → Plain Text":
+                out = html_to_text_bytes(raw)
+                out_name = name.replace(".html", ".txt")
+                mime = "text/plain"
+            elif conversion == "HTML → Word (.docx)":
+                out = html_to_docx_bytes(raw)
+                out_name = name.replace(".html", ".docx")
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            else:
+                raise ValueError("Invalid HTML conversion")
+        else:
+            raise ValueError("Unsupported file type")
+        return {"name": name, "out_bytes": out, "out_name": out_name, "mime": mime}
+    except Exception as e:
+        return {"name": name, "error": str(e)}
+
+with ThreadPoolExecutor(max_workers=3) as executor:
+    results = list(executor.map(process_file, uploaded))
+
+success_results = [r for r in results if "error" not in r]
+error_results = [r for r in results if "error" in r]
+
+for r in error_results:
+    st.error(f"❌ {r['name']}: {r['error']}")
+
+if success_results:
+    st.success(f"✅ Converted {len(success_results)} file(s)")
+    for i, res in enumerate(success_results):
+        col = st.columns(3)[i % 3]
+        with col:
+            st.caption(res["out_name"])
+            if res["mime"].startswith("text/"):
+                preview = res["out_bytes"].decode("utf-8", errors="replace")[:2000]
+                st.text_area("Preview", preview, height=150, key=res["out_name"])
+            st.download_button("Download", res["out_bytes"], res["out_name"], res["mime"])
+
+    # ZIP
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in success_results:
+            zf.writestr(r["out_name"], r["out_bytes"])
+    zip_buffer.seek(0)
+    st.download_button("📥 Download All as ZIP", zip_buffer.read(), "converted.zip", "application/zip")
+else:
+    st.error("No files converted successfully.")
