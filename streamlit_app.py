@@ -34,7 +34,8 @@ from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.style import WD_STYLE_TYPE
-import pandas as pd # pandas is imported but not explicitly used in the final version, could be removed if not needed for future features
+# pandas is imported but not explicitly used in the final version, could be removed if not needed for future features
+# import pandas as pd 
 
 # -----------------------------
 # Utility / Heuristic Functions
@@ -58,8 +59,7 @@ def is_numbered_line(text: str) -> bool:
 def normalize_whitespace_for_output(s: str) -> str:
     """
     Simplifies whitespace for cleaner output, keeping essential line breaks.
-    This is less aggressive than `re.sub(r'\s+', ' ', s).strip()` to preserve
-    some natural line breaks within paragraphs.
+    Reduces multiple spaces and newlines for consistent output.
     """
     s = re.sub(r'[ \t]+', ' ', s) # Multiple spaces to single space
     s = re.sub(r'\n{3,}', '\n\n', s) # Reduce excessive newlines to at most two
@@ -74,165 +74,207 @@ def choose_heading_levels(unique_sizes: List[float], max_levels: int = 4) -> Dic
     if not unique_sizes:
         return {}
     
-    # Sort distinct sizes from largest to smallest
     sorted_sizes = sorted(list(set(unique_sizes)), reverse=True)
-    
     mapping = {}
-    # Assign heading levels to the largest unique font sizes
     for idx, size in enumerate(sorted_sizes[:max_levels]):
         mapping[round(size, 2)] = idx + 1 # Levels 1 to max_levels
     
     return mapping
 
 # -----------------------------
-# Advanced PDF Content Extraction (Text + Images)
+# Advanced PDF Content Extraction (Text + Images + Tables)
 # -----------------------------
 
-def extract_page_content_advanced(page: fitz.Page, min_para_size: float = 8.0, 
-                                 line_gap_threshold: float = 0.5, char_gap_threshold: float = 0.1) -> Tuple[List[Dict], List[Dict], List[float]]:
+def extract_page_elements_detailed(
+    doc: fitz.Document, 
+    page_idx: int, 
+    min_para_size: float = 8.0, 
+    line_gap_threshold: float = 0.5, # Factor of font_height to consider a new line
+    para_gap_threshold: float = 1.5, # Factor of font_height to consider a new paragraph
+    min_font_change_for_heading: float = 0.15 # % change for new heading heuristic
+) -> Tuple[List[Dict], List[float]]:
     """
-    Extracts all text spans with their properties, groups them into logical lines and elements,
-    and extracts images.
-    Returns: (text_elements, image_elements, all_span_sizes)
+    Extracts all text spans, images, and tables from a page, and then reconstructs
+    logical elements (headings, paragraphs, lists, images, tables) with their bboxes.
+    Returns: (list_of_combined_elements, all_span_sizes_on_page)
     """
-    text_elements = []
-    image_elements = []
-    all_span_sizes = []
+    page = doc.load_page(page_idx)
+    page_width = page.rect.width
+    page_height = page.rect.height
+    combined_elements = []
+    all_span_sizes_on_page = []
 
-    # 1. Extract and process all text spans
-    raw_text_dict = page.get_text("rawdict")
-    spans = []
-    for block in raw_text_dict.get("blocks", []):
+    # 1. Extract raw text spans
+    raw_spans = []
+    text_blocks_raw = page.get_text("rawdict").get("blocks", [])
+    for block in text_blocks_raw:
         if block.get("type") == 0:  # Text block
             for line in block.get("lines", []):
                 for span in line.get("spans", []):
-                    if span.get("text", "").strip(): # Only consider non-empty text
-                        spans.append({
+                    if span.get("text", "").strip():
+                        s_bbox = fitz.Rect(span["bbox"])
+                        # Filter out very small, likely noise spans
+                        if s_bbox.height < 2 or s_bbox.width < 2: continue
+
+                        raw_spans.append({
                             "text": span["text"],
                             "size": round(span["size"], 2),
                             "font": span["font"],
-                            "bbox": fitz.Rect(span["bbox"]) # Convert to fitz.Rect object
+                            "flags": span["flags"],
+                            "color": span["color"],
+                            "bbox": s_bbox # Store as fitz.Rect
                         })
-                        all_span_sizes.append(span["size"])
+                        all_span_sizes_on_page.append(span["size"])
 
-    # Sort spans by vertical position, then horizontal for reading order
-    spans.sort(key=lambda s: (s["bbox"].y0, s["bbox"].x0))
-
-    if not spans:
-        return [], [], all_span_sizes # No text on page
-
-    current_line_spans = []
-    current_line_y = -1
-
-    # Group spans into lines first
-    lines = []
-    for span in spans:
-        if not current_line_spans or (span["bbox"].y0 - current_line_y > line_gap_threshold * span["bbox"].height):
-            # Start a new line
-            if current_line_spans:
-                lines.append(current_line_spans)
-            current_line_spans = [span]
-            current_line_y = span["bbox"].y0
-        else:
-            # Add to current line, update Y (average or min)
-            current_line_spans.append(span)
-            current_line_y = min(current_line_y, span["bbox"].y0) # Adjust line Y to lowest span in line
-
-    if current_line_spans:
-        lines.append(current_line_spans)
-
-    # Now group lines into elements (paragraphs, headings, lists)
-    current_element_lines = []
-    current_element_type = "para" # Default
-    current_element_size = 0.0 # Max size in current element
-    
-    for line_spans in lines:
-        line_text = "".join([s["text"] for s in line_spans]).strip()
-        if not line_text:
-            continue
-
-        line_max_size = max(s["size"] for s in line_spans)
-        
-        # Check for list items
-        is_list = is_bullet_line(line_text) or is_numbered_line(line_text)
-        
-        # Heuristic for new element: significant font size change, empty line, or list type change
-        new_element_needed = False
-        if not current_element_lines: # First line of content
-            new_element_needed = True
-        elif abs(line_max_size - current_element_size) > min_para_size * 0.15: # Significant font change
-            new_element_needed = True
-        elif is_list and current_element_type != "list": # Transition to list
-            new_element_needed = True
-        elif not is_list and current_element_type == "list": # Transition from list
-            new_element_needed = True
-        elif not line_text.strip(): # Explicit blank line
-             new_element_needed = True
-
-        if new_element_needed and current_element_lines:
-            # Flush previous element
-            combined_text = "\n".join(sanitize_text("".join([s["text"] for s in ls])) for ls in current_element_lines if ls)
-            if combined_text:
-                if current_element_type == "list":
-                    # This logic should group list items properly when flush
-                    text_elements.append({"type": "list", "items": [sanitize_text("".join([s["text"] for s in ls])) for ls in current_element_lines], "list_type": "bullet"}) # Simplified to bullet for now
-                else: # para or heading
-                    text_elements.append({"type": current_element_type, "text": combined_text, "size": current_element_size})
-            current_element_lines = []
-            current_element_size = 0.0
-
-        # Add current line to new element
-        current_element_lines.append(line_spans)
-        current_element_size = max(current_element_size, line_max_size)
-        current_element_type = "list" if is_list else "para" # Re-evaluate type for current line
-
-    # Flush the last element after loop
-    if current_element_lines:
-        combined_text = "\n".join(sanitize_text("".join([s["text"] for s in ls])) for ls in current_element_lines if ls)
-        if combined_text:
-            if current_element_type == "list":
-                text_elements.append({"type": "list", "items": [sanitize_text("".join([s["text"] for s in ls])) for ls in current_element_lines], "list_type": "bullet"})
-            else:
-                text_elements.append({"type": current_element_type, "text": combined_text, "size": current_element_size})
-
+    # Sort raw spans primarily by vertical position, then horizontal for reading order
+    raw_spans.sort(key=lambda s: (s["bbox"].y0, s["bbox"].x0))
 
     # 2. Extract images
     img_list = page.get_images(full=True)
-    for img_index, img in enumerate(img_list):
-        xref = img[0]
+    for img_index, img_info in enumerate(img_list):
+        xref = img_info[0]
         base_image = doc.extract_image(xref)
         image_bytes = base_image["image"]
         image_ext = base_image["ext"]
         image_mime = f"image/{image_ext}"
         
-        # Get image bbox (approximated, as PyMuPDF's get_images doesn't provide it directly in this form easily)
-        # We need to look for image objects on the page with their actual bounding boxes
-        # This is a bit more involved: iterate through page objects
-        found_bbox = None
-        for item in page.get_displaylist()._image_info: # Accessing internal structure, might break
+        # Get image bbox directly from display list if possible for accuracy
+        image_bbox = None
+        for item in page.get_displaylist()._image_info:
             if item.get("xref") == xref:
-                found_bbox = item.get("bbox")
+                image_bbox = fitz.Rect(item.get("bbox"))
                 break
         
-        if not found_bbox: # Fallback: if bbox not found, estimate or ignore
-            found_bbox = (0, 0, page.rect.width, page.rect.height) # Placeholder
+        if not image_bbox: # Fallback if bbox not found
+            # A more robust fallback would be to try to match img_info with page.get_pixmap()._image_info
+            # For simplicity, use a generic size if bbox cannot be precisely determined.
+            image_bbox = fitz.Rect(0, 0, page_width / 4, page_height / 4) 
 
-        # Encode image to base64 for embedding in HTML
         b64_image = base64.b64encode(image_bytes).decode('utf-8')
-        image_elements.append({
+        combined_elements.append({
             "type": "image",
             "data": f"data:{image_mime};base64,{b64_image}",
-            "bbox": fitz.Rect(found_bbox) # Store bbox for potential sorting
+            "bbox": image_bbox,
+            "y0_sort": image_bbox.y0 # For sorting
         })
     
-    # Sort images by vertical position for better flow
-    image_elements.sort(key=lambda img: img["bbox"].y0)
+    # 3. Extract tables
+    tables_on_page = []
+    try:
+        with pdfplumber.open(io.BytesIO(doc.tobytes())) as ppdf:
+            plumber_page = ppdf.pages[page_idx]
+            extracted_tables = plumber_page.extract_tables()
+            for t_idx, t_rows in enumerate(extracted_tables):
+                if t_rows and any(any(cell for cell in row if cell not in (None, "")) for row in t_rows):
+                    cleaned_table = [[str(c) if c is not None else "" for c in row] for row in t_rows]
+                    table_plumber_bbox = plumber_page.find_tables()[t_idx].bbox
+                    table_bbox = fitz.Rect(table_plumber_bbox)
+                    combined_elements.append({
+                        "type": "table",
+                        "rows": cleaned_table,
+                        "bbox": table_bbox,
+                        "y0_sort": table_bbox.y0 # For sorting
+                    })
+    except Exception as e:
+        print(f"Warning: Error extracting tables from PDF page {page_idx+1} with pdfplumber: {e}")
 
-    return text_elements, image_elements, all_span_sizes
+    # 4. Reconstruct logical text elements from sorted spans
+    text_elements_from_spans = []
+    if raw_spans:
+        current_paragraph_spans = []
+        current_paragraph_bbox = None
+        
+        for i, span in enumerate(raw_spans):
+            is_new_line = False
+            is_new_paragraph = False
+            
+            # Heuristic for new line (if not first span)
+            if current_paragraph_spans:
+                last_span = current_paragraph_spans[-1]
+                # Check if vertical gap is significant (new line)
+                if span["bbox"].y0 > last_span["bbox"].y1 + line_gap_threshold * span["bbox"].height:
+                    is_new_line = True
+                    # Check if gap is even larger (new paragraph)
+                    if span["bbox"].y0 > last_span["bbox"].y1 + para_gap_threshold * span["bbox"].height:
+                        is_new_paragraph = True
+                # Check horizontal gap if on same "line" (could indicate column break or explicit new line)
+                elif span["bbox"].x0 > last_span["bbox"].x1 + char_gap_threshold * span["bbox"].width * 5: # Large horizontal gap
+                     is_new_line = True # Consider it a new line
+                     
+                # Also consider significant font size change as a potential new paragraph/heading
+                if abs(span["size"] - last_span["size"]) > min_font_change_for_heading * span["size"] and \
+                   span["size"] >= min_para_size: # Only if above min readable font size
+                    is_new_paragraph = True
+
+            if is_new_paragraph or not current_paragraph_spans:
+                if current_paragraph_spans:
+                    # Flush previous paragraph
+                    text_elements_from_spans.append({"type": "temp_text", "spans": current_paragraph_spans})
+                current_paragraph_spans = [span]
+            elif is_new_line:
+                # Add a newline marker if it's a new line within the same logical paragraph
+                current_paragraph_spans.append({"text": "\n", "size": span["size"], "bbox": span["bbox"]}) # Placeholder for newline
+                current_paragraph_spans.append(span)
+            else:
+                current_paragraph_spans.append(span)
+
+        if current_paragraph_spans:
+            text_elements_from_spans.append({"type": "temp_text", "spans": current_paragraph_spans})
+
+    # Now, convert temp_text elements into proper paragraphs/headings/lists
+    final_text_elements = []
+    for temp_el in text_elements_from_spans:
+        full_text = "".join([s["text"] for s in temp_el["spans"] if s["text"] != "\n"]).strip()
+        if not full_text: continue
+
+        # Calculate combined bbox for the element
+        min_x, min_y, max_x, max_y = page_width, page_height, 0, 0
+        for span in temp_el["spans"]:
+            if span["text"] != "\n": # Don't use newline markers for bbox calc
+                min_x = min(min_x, span["bbox"].x0)
+                min_y = min(min_y, span["bbox"].y0)
+                max_x = max(max_x, span["bbox"].x1)
+                max_y = max(max_y, span["bbox"].y1)
+        element_bbox = fitz.Rect(min_x, min_y, max_x, max_y)
+
+        # Determine type (list, para, potential heading)
+        first_line = full_text.split('\n')[0]
+        if is_bullet_line(first_line) or is_numbered_line(first_line):
+            list_type = "numbered" if is_numbered_line(first_line) else "bullet"
+            # Split into individual list items for better processing
+            items = [sanitize_text(line) for line in full_text.split('\n') if sanitize_text(line)]
+            final_text_elements.append({
+                "type": "list",
+                "items": items,
+                "list_type": list_type,
+                "bbox": element_bbox,
+                "y0_sort": element_bbox.y0,
+                "size": max(s["size"] for s in temp_el["spans"] if s["text"] != "\n") # Representative size
+            })
+        else:
+            final_text_elements.append({
+                "type": "para", # Default to paragraph, will be refined to heading later
+                "text": normalize_whitespace_for_output(full_text),
+                "bbox": element_bbox,
+                "y0_sort": element_bbox.y0,
+                "size": max(s["size"] for s in temp_el["spans"] if s["text"] != "\n") # Representative size
+            })
+    
+    combined_elements.extend(final_text_elements)
+    
+    # Sort all elements (text, images, tables) by their y0_sort property
+    combined_elements.sort(key=lambda x: x["y0_sort"])
+
+    return combined_elements, all_span_sizes_on_page
 
 
-def parse_pdf_structured(pdf_bytes: bytes, min_heading_ratio: float = 1.12, min_para_size: float = 8.0, 
-                         filter_repeated_text: bool = True) -> Dict[str, Any]:
+def parse_pdf_structured(pdf_bytes: bytes, min_heading_ratio: float = 1.12, 
+                         min_para_size: float = 7.0, 
+                         filter_repeated_text: bool = True,
+                         line_gap_threshold: float = 0.5,
+                         para_gap_threshold: float = 1.5,
+                         min_font_change_for_heading: float = 0.15
+                         ) -> Dict[str, Any]:
     """
     Parse PDF into a structured intermediate representation, incorporating images and advanced text parsing.
     """
@@ -240,236 +282,92 @@ def parse_pdf_structured(pdf_bytes: bytes, min_heading_ratio: float = 1.12, min_
     pages_out = []
     all_doc_sizes = []
     
-    # Collect potential repeated text for filtering
+    # --- First pass: Collect font sizes and identify repeated text elements ---
     repeated_text_candidates = Counter()
-    per_page_text_lines = [] # Store lines with their approximate bbox for filtering
+    temp_all_page_elements_raw = [] # To store elements before filtering/final typing
 
-    # First pass to collect all text and potential repeated elements
     for p_idx in range(len(doc)):
+        # Use a preliminary extraction to get lines and their approximate bboxes
+        # This is a lighter pass than `extract_page_elements_detailed`
         page = doc.load_page(p_idx)
-        page_lines_with_bbox = []
-        for block in page.get_text("dict").get("blocks", []):
+        raw_text_dict = page.get_text("dict")
+        page_lines_for_filter = []
+
+        for block in raw_text_dict.get("blocks", []):
             if block.get("type") == 0:
                 for line in block.get("lines", []):
                     line_text = "".join([span["text"] for span in line.get("spans", [])]).strip()
                     if line_text:
-                        # Use a rounded bbox center for matching repeated elements
+                        # Normalize text and use a rounded bbox center for matching repeated elements
                         bbox_center = (fitz.Rect(line["bbox"]).x0 // 20, fitz.Rect(line["bbox"]).y0 // 20)
-                        page_lines_with_bbox.append((line_text, bbox_center))
-                        repeated_text_candidates[(line_text, bbox_center)] += 1
-        per_page_text_lines.append(page_lines_with_bbox)
+                        normalized_line_text = normalize_whitespace_for_output(line_text)
+                        page_lines_for_filter.append((normalized_line_text, bbox_center, fitz.Rect(line["bbox"])))
+                        repeated_text_candidates[(normalized_line_text, bbox_center)] += 1
+        
+        temp_all_page_elements_raw.append(page_lines_for_filter)
 
     # Determine truly repeated elements (appear on > 50% of pages in same position)
     num_pages = len(doc)
     threshold = num_pages * 0.5
-    filtered_out_elements = set()
+    if num_pages < 2: # Don't filter if only one page or very few pages
+        filter_repeated_text = False
+
+    filtered_out_elements_set = set()
     if filter_repeated_text:
         for (text, bbox_center), count in repeated_text_candidates.items():
-            if count > threshold:
-                filtered_out_elements.add((text, bbox_center))
+            if count >= threshold: # Use >= for exact match
+                filtered_out_elements_set.add((text, bbox_center))
 
-
-    # Second pass: Process each page for final elements
+    # --- Second pass: Detailed extraction and filtering ---
     for p_idx in range(len(doc)):
-        page = doc.load_page(p_idx)
-        page_elements = []
-
-        # Extract images and text elements with font sizes
-        raw_text_elements, image_elements, current_page_sizes = \
-            extract_page_content_advanced(page, min_para_size=min_para_size)
+        page_elements, current_page_sizes = extract_page_elements_detailed(
+            doc, p_idx, min_para_size, line_gap_threshold, para_gap_threshold, min_font_change_for_heading
+        )
         all_doc_sizes.extend(current_page_sizes)
 
-        # Apply filtering for repeated text
-        filtered_text_elements = []
-        for el in raw_text_elements:
+        final_page_elements = []
+        for el in page_elements:
             if el["type"] in ["para", "heading", "list"]:
-                # Flatten list items for checking, use first item's bbox for list entry
-                check_text = el["text"] if el["type"] != "list" else el["items"][0]
+                # For filtering, use the text of the element and its approximated bbox center
+                text_for_filter = el["text"].split('\n')[0] if el["type"] != "list" else el["items"][0]
+                text_for_filter = normalize_whitespace_for_output(text_for_filter)
                 
-                # Approximate bbox center for comparison (assumes element has bbox, which rawdict helps with)
-                # This is a bit of a hack without direct bbox for combined elements, so re-extract a span-level bbox
-                first_span_bbox = None
-                if el["type"] == "para" or el["type"] == "heading":
-                    # For para/heading, get bbox of the first line of text for comparison
-                    raw_text_dict = page.get_text("rawdict")
-                    for block in raw_text_dict.get("blocks", []):
-                        if block.get("type") == 0:
-                            for line in block.get("lines", []):
-                                line_content = "".join([s["text"] for s in line["spans"]]).strip()
-                                if line_content == el["text"].split('\n')[0]: # Match first line
-                                    first_span_bbox = fitz.Rect(line["bbox"])
-                                    break
-                            if first_span_bbox: break
-                elif el["type"] == "list" and el["items"]:
-                     raw_text_dict = page.get_text("rawdict")
-                     for block in raw_text_dict.get("blocks", []):
-                        if block.get("type") == 0:
-                            for line in block.get("lines", []):
-                                line_content = "".join([s["text"] for s in line["spans"]]).strip()
-                                if line_content == el["items"][0]: # Match first item
-                                    first_span_bbox = fitz.Rect(line["bbox"])
-                                    break
-                            if first_span_bbox: break
+                # Use bbox of the element directly
+                bbox_center = (el["bbox"].x0 // 20, el["bbox"].y0 // 20)
                 
-                if first_span_bbox:
-                    bbox_center = (first_span_bbox.x0 // 20, first_span_bbox.y0 // 20)
-                    if (sanitize_text(check_text.split('\n')[0]), bbox_center) in filtered_out_elements:
-                         # Skip this element if it's a repeated header/footer
-                        continue
-            filtered_text_elements.append(el)
+                if filter_repeated_text and (text_for_filter, bbox_center) in filtered_out_elements_set:
+                    continue # Skip this element as it's a repeated header/footer
 
-        # Combine text and images by vertical position (approximated)
-        all_content_elements = []
-        for el in filtered_text_elements:
-            # Need an approximate y-position for text elements
-            if el["type"] in ["para", "heading", "list"] and el.get("text") or el.get("items"):
-                # Use max_block_span_sz from original parse_pdf_structured for rough estimate
-                # For `extract_page_content_advanced`, we would need to get bbox for the whole combined element
-                # For now, let's just use first line/item's bbox y0
-                y0_approx = None
-                if el["type"] in ["para", "heading"]:
-                    first_line = el["text"].split('\n')[0]
-                    for text_line_data, bbox_center in per_page_text_lines[p_idx]:
-                        if sanitize_text(text_line_data) == sanitize_text(first_line):
-                            # This needs a more direct way to get y0 from `extract_page_content_advanced`
-                            # For now, we'll sort the output after table insertion.
-                            pass
-                elif el["type"] == "list" and el["items"]:
-                    first_item = el["items"][0]
-                    for text_line_data, bbox_center in per_page_text_lines[p_idx]:
-                        if sanitize_text(text_line_data) == sanitize_text(first_item):
-                            pass
-                
-                all_content_elements.append({
-                    "type": el["type"],
-                    "content": el,
-                    "y0": el["text_bbox"].y0 if "text_bbox" in el else (0 if not text_elements else text_elements[0]["bbox"].y0) # Placeholder
-                })
+            final_page_elements.append(el)
         
-        # Simpler approach: Just append images and tables after text elements for now, then sort.
-        for el in filtered_text_elements:
-            page_elements.append(el)
-        for img_el in image_elements:
-            page_elements.append(img_el)
+        pages_out.append({"page_number": p_idx + 1, "elements": final_page_elements})
 
-        # Table detection with pdfplumber
-        tables_on_page = []
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as ppdf:
-                page_pl = ppdf.pages[p_idx]
-                extracted_tables = page_pl.extract_tables()
-                for t in extracted_tables:
-                    if t and any(any(cell for cell in row if cell not in (None, "")) for row in t):
-                        cleaned_table = [[str(c) if c is not None else "" for c in row] for row in t]
-                        # Store bbox for tables for sorting
-                        table_bbox = page_pl.find_tables()[extracted_tables.index(t)].bbox
-                        tables_on_page.append({"type": "table", "rows": cleaned_table, "bbox": fitz.Rect(table_bbox)})
-        except Exception as e:
-            print(f"Warning: Error extracting tables from PDF page {p_idx+1} with pdfplumber: {e}")
-            tables_on_page = []
-
-        # Add tables to page elements and sort everything by approximate vertical position
-        for tbl_el in tables_on_page:
-            page_elements.append(tbl_el)
-        
-        # Sort all elements (text, images, tables) by their top-most coordinate
-        # This requires `y0` or similar to be present on all elements
-        def get_y0_for_sorting(element):
-            if element["type"] == "image":
-                return element["bbox"].y0
-            elif element["type"] == "table":
-                return element["bbox"].y0
-            elif "bbox" in element: # Text elements with explicit bbox
-                return element["bbox"].y0
-            # For `raw_text_elements`, the lines already sorted, so taking first line's y0 is complex here.
-            # We need to ensure `extract_page_content_advanced` returns elements with `bbox` or a `y0` property.
-            # For simplicity for now, this part needs careful definition of `element` structure from `extract_page_content_advanced`.
-            # Let's assume for combined text elements, we can get a representative y0.
-            # Revisit this: `extract_page_content_advanced` should yield "elements" not just "spans"
-            # and these "elements" should have a `bbox` for sorting.
-
-            # Temporary fallback for text elements (this is imperfect)
-            if element["type"] in ["para", "heading", "list"]:
-                # Try to get y0 from one of its component spans if available
-                if "content" in element and isinstance(element["content"], dict):
-                    if element["content"].get("items") and isinstance(element["content"]["items"], list):
-                        # For list items, first item's line top
-                        line_text_raw = element["content"]["items"][0]
-                        line_text_clean = sanitize_text(line_text_raw)
-                        # This needs to be improved to get precise y0 for combined elements
-                        # For now, a rough estimate is better than unsorted.
-                        # We will make extract_page_content_advanced return combined elements with bbox
-                        pass
-                return 0 # Put unsortable elements at top
-            return 0 # Default if bbox not found
-
-
-        # The `extract_page_content_advanced` returns individual span properties, not combined element bboxes directly.
-        # This makes sorting text elements with images/tables problematic.
-        # Let's simplify: `extract_page_content_advanced` will produce elements (heading/para/list/image),
-        # each with a `bbox` property.
-        
-        # Re-parse: to make sorting work, we need all elements (text, image, table) to have a .y0
-        # The `raw_text_elements` returned from `extract_page_content_advanced` need a `bbox` property.
-        
-        final_elements_on_page = []
-        
-        # Re-iterate `raw_text_elements` to assign representative bbox
-        for el in raw_text_elements:
-            if el["type"] in ["para", "heading"]:
-                # To assign bbox for a combined element: get the bbox of all its constituent lines
-                # This would require modifying `extract_page_content_advanced` to return combined_bbox
-                # For now, let's use the bbox of the first line/span within the element as a proxy for sorting
-                first_line_text = el["text"].split('\n')[0]
-                temp_bbox = None
-                for block in page.get_text("dict").get("blocks", []): # This is inefficient, but necessary to get bbox
-                    if block.get("type") == 0:
-                        for line in block.get("lines", []):
-                            line_content = "".join([span["text"] for span in line.get("spans", [])]).strip()
-                            if sanitize_text(line_content) == sanitize_text(first_line_text):
-                                temp_bbox = fitz.Rect(line["bbox"])
-                                break
-                        if temp_bbox: break
-                el["bbox"] = temp_bbox if temp_bbox else fitz.Rect(0,0,page.rect.width, 10) # Fallback bbox
-                final_elements_on_page.append(el)
-
-            elif el["type"] == "list" and el["items"]:
-                first_item_text = el["items"][0]
-                temp_bbox = None
-                for block in page.get_text("dict").get("blocks", []):
-                    if block.get("type") == 0:
-                        for line in block.get("lines", []):
-                            line_content = "".join([span["text"] for span in line.get("spans", [])]).strip()
-                            if sanitize_text(line_content) == sanitize_text(first_item_text):
-                                temp_bbox = fitz.Rect(line["bbox"])
-                                break
-                        if temp_bbox: break
-                el["bbox"] = temp_bbox if temp_bbox else fitz.Rect(0,0,page.rect.width, 10) # Fallback bbox
-                final_elements_on_page.append(el)
-            else: # Images (already have bbox)
-                final_elements_on_page.append(el)
-        
-        for tbl_el in tables_on_page:
-            final_elements_on_page.append(tbl_el) # Tables already have bbox
-
-        # Final sort of all elements on the page
-        final_elements_on_page.sort(key=lambda x: x["bbox"].y0)
-
-        pages_out.append({"page_number": p_idx + 1, "elements": final_elements_on_page})
-
-    # Recalculate global font hierarchy from all non-filtered text
+    # --- Final pass: Apply global heading styles based on document-wide font analysis ---
     unique_doc_sizes = sorted(set(s for s in all_doc_sizes if s >= min_para_size), reverse=True)
     font_to_heading = choose_heading_levels(unique_doc_sizes)
 
-    # Apply heading levels to parsed text elements in pages_out
+    # Get body text size (most common size) for better heading inference
+    body_text_size = 0.0
+    if all_doc_sizes:
+        size_counts = Counter(round(s, 2) for s in all_doc_sizes if s >= min_para_size)
+        if size_counts:
+            body_text_size = size_counts.most_common(1)[0][0]
+            # If body_text_size was incorrectly assigned a heading level, demote it
+            if body_text_size in font_to_heading and font_to_heading[body_text_size] == max(font_to_heading.values()):
+                del font_to_heading[body_text_size]
+    
+    max_doc_size = max(unique_doc_sizes) if unique_doc_sizes else 12.0
+    heading_threshold = max_doc_size / min_heading_ratio # Heuristic threshold
+
     for page_data in pages_out:
         for el in page_data["elements"]:
-            if el["type"] == "para" and "size" in el: # Only for "para" initially
+            if el["type"] == "para" and "size" in el: # Only refine paragraphs
                 mapped_level = font_to_heading.get(round(el["size"], 2), 0)
-                if mapped_level > 0 or (el["size"] >= (max(unique_doc_sizes) / min_heading_ratio) and el["size"] > (Counter(round(s, 2) for s in all_doc_sizes if s >= min_para_size).most_common(1)[0][0] if all_doc_sizes else 0)):
+                # If mapped or significantly larger than body text and threshold
+                if mapped_level > 0 or (el["size"] >= heading_threshold and el["size"] > body_text_size):
                     el["type"] = "heading"
-                    el["level"] = mapped_level if mapped_level > 0 else 2 # Default to H2 if heuristic
-    
+                    el["level"] = mapped_level if mapped_level > 0 else 2 # Default to H2 if just threshold
+
     return {"pages": pages_out, "fontsizes": unique_doc_sizes}
 
 
@@ -496,7 +394,7 @@ def structured_to_html(parsed: dict, embed_pdf: bool = False, pdf_bytes: bytes =
         'h1, h2, h3, h4, h5, h6 { margin-top: 1em; margin-bottom: 0.5em; }',
         'ul, ol { margin-left: 1.5em; margin-bottom: 1em; }',
         'p { margin-bottom: 1em; }',
-        'img { max-width: 100%; height: auto; display: block; margin: 1em auto; }', # Added img style
+        'img { max-width: 100%; height: auto; display: block; margin: 1em auto; }', 
         '</style>',
         '</head>',
         '<body>'
@@ -536,7 +434,6 @@ def structured_to_html(parsed: dict, embed_pdf: bool = False, pdf_bytes: bytes =
                     current_list_type = el["list_type"]
                 
                 for item_text in el["items"]:
-                    # Clean bullets/numbers as HTML handles them visually
                     clean_item_text = re.sub(BULLET_CHARS if el["list_type"]=="bullet" else NUMBER_CHARS, "", item_text).strip()
                     parts.append(f"<li>{html.escape(normalize_whitespace_for_output(clean_item_text if clean_item_text else item_text))}</li>")
             
@@ -558,7 +455,13 @@ def structured_to_html(parsed: dict, embed_pdf: bool = False, pdf_bytes: bytes =
                 if current_list_type:
                     parts.append(f'</{"ul" if current_list_type == "bullet" else "ol"}>')
                     current_list_type = None
-                parts.append(f'<img src="{el["data"]}" alt="Image from PDF" style="width:{el["bbox"].width}px; height:{el["bbox"].height}px;"/>') # Embed images with their original dimensions
+                
+                # HTML Image width/height. Use max-width:100% for responsiveness,
+                # but set original dimensions as attributes for reference.
+                width_attr = f'width="{el["bbox"].width}"' if el["bbox"].width > 0 else ''
+                height_attr = f'height="{el["bbox"].height}"' if el["bbox"].height > 0 else ''
+
+                parts.append(f'<img src="{el["data"]}" alt="Image from PDF" {width_attr} {height_attr}/>')
 
 
         if current_list_type:
@@ -582,13 +485,13 @@ def structured_to_text(parsed: dict) -> bytes:
         out_lines.append(f"\n--- PAGE {page['page_number']} ---\n")
         
         for el in page["elements"]:
-            norm_text = normalize_whitespace_for_output(el["text"]) if "text" in el else ""
             if el["type"] == "heading":
+                norm_text = normalize_whitespace_for_output(el["text"])
                 out_lines.append(norm_text.upper())
-                out_lines.append("=" * len(norm_text)) 
+                out_lines.append("=" * min(len(norm_text), 80)) # Limit underline length
                 out_lines.append("")
             elif el["type"] == "para":
-                out_lines.append(norm_text)
+                out_lines.append(normalize_whitespace_for_output(el["text"]))
                 out_lines.append("")
             elif el["type"] == "list":
                 for item_text in el["items"]:
@@ -604,7 +507,7 @@ def structured_to_text(parsed: dict) -> bytes:
                         out_lines.append("\t".join(["-" * len(cell) if cell else "---" for cell in cells_formatted]))
                 out_lines.append("") 
             elif el["type"] == "image":
-                out_lines.append(f"[IMAGE: {el['data'][:50]}... (base64 data)]")
+                out_lines.append(f"[IMAGE: Embedded, size {el['bbox'].width:.0f}x{el['bbox'].height:.0f}px]")
                 out_lines.append("")
     joined = "\n".join(out_lines).strip()
     return joined.encode("utf-8")
@@ -677,24 +580,21 @@ def structured_to_docx(parsed: dict) -> bytes:
                 
                 doc.add_paragraph("") 
             elif el["type"] == "image":
-                # docx needs raw bytes, not base64
                 try:
-                    # Extract image bytes from base64 data string
                     img_data_b64 = el['data'].split(';base64,')[1]
                     img_bytes = base64.b64decode(img_data_b64)
                     
-                    # Add image to docx, convert pixel dimensions to EMUs (used by docx)
-                    # 1 inch = 914400 EMUs, 1px = 914400/96 EMUs (assuming 96 DPI)
-                    # For a more precise conversion, you'd need the PDF's DPI
-                    # Here, using 96 DPI as a common web standard
-                    width_emus = int(el["bbox"].width * 914400 / 96)
-                    height_emus = int(el["bbox"].height * 914400 / 96)
-
-                    # Ensure image bytes are valid for python-docx
                     img_stream = io.BytesIO(img_bytes)
-                    doc.add_picture(img_stream, width=Inches(el["bbox"].width / 96) if el["bbox"].width > 0 else None, 
-                                    height=Inches(el["bbox"].height / 96) if el["bbox"].height > 0 else None)
-                    doc.add_paragraph("") # Spacing after image
+                    
+                    # Convert pixel width/height to Inches for docx
+                    # Assuming 96 DPI for screen pixels to print inches
+                    width_inches = el["bbox"].width / 96.0
+                    height_inches = el["bbox"].height / 96.0
+
+                    doc.add_picture(img_stream, 
+                                    width=Inches(width_inches) if width_inches > 0 else None, 
+                                    height=Inches(height_inches) if height_inches > 0 else None)
+                    doc.add_paragraph("") 
                 except Exception as img_e:
                     doc.add_paragraph(f"[Failed to embed image: {img_e}]")
                     print(f"Error embedding image in DOCX: {img_e}")
@@ -750,7 +650,6 @@ def html_to_docx_bytes(html_bytes: bytes) -> bytes:
                 img_src = element['src']
                 if img_src.startswith('data:image'):
                     try:
-                        # Extract base64 data
                         mime_type, img_data_b64 = img_src.split(';base64,')
                         img_bytes = base64.b64decode(img_data_b64)
                         img_stream = io.BytesIO(img_bytes)
@@ -759,18 +658,17 @@ def html_to_docx_bytes(html_bytes: bytes) -> bytes:
                         width = None
                         height = None
                         if element.has_attr('width'):
-                            try: width = Inches(float(element['width']) / 96) # Assume 96 DPI
+                            try: width = Inches(float(element['width']) / 96) 
                             except ValueError: pass
                         if element.has_attr('height'):
                             try: height = Inches(float(element['height']) / 96)
                             except ValueError: pass
 
                         doc_obj.add_picture(img_stream, width=width, height=height)
-                        doc_obj.add_paragraph("") # Spacing
+                        doc_obj.add_paragraph("") 
                     except Exception as img_e:
                         doc_obj.add_paragraph(f"[Failed to embed image from HTML: {img_e}]")
-                # Handle external image links (not directly embedding, but marking)
-                elif img_src:
+                elif img_src: # External image links
                     doc_obj.add_paragraph(f"[Image: {img_src}]")
             # Tables
             elif element.name == "table":
@@ -860,7 +758,7 @@ with st.sidebar:
         min_value=4.0, max_value=14.0, value=7.0, step=0.5,
         help="Ignore text smaller than this (e.g., page numbers, tiny footnotes) to clean up structure."
     )
-    filter_repeated_text = st.checkbox(
+    filter_repeated_text_sidebar = st.checkbox( # Renamed to avoid conflict with function param
         "Filter Repeated Headers/Footers", 
         value=True, 
         help="Attempts to remove text that appears in the same position on most pages (e.g., 'Thank You', page numbers). Useful for presentations."
@@ -889,22 +787,23 @@ errors_occurred = []
 
 def process_single_file(uploaded_file_obj):
     file_name = uploaded_file_obj.name
-    # Read once
     raw_bytes = uploaded_file_obj.read()
     file_ext = os.path.splitext(file_name)[1].lower()
     
     result_entry = {"name": file_name}
     
     try:
-        # Determine input type and process
         if file_ext == ".pdf":
-            # Parse PDF structure once
-            parsed_content = parse_pdf_structured(raw_bytes, 
-                                                min_heading_ratio=heading_ratio, 
-                                                min_para_size=min_para_size,
-                                                filter_repeated_text=filter_repeated_text)
+            parsed_content = parse_pdf_structured(
+                raw_bytes, 
+                min_heading_ratio=heading_ratio, 
+                min_para_size=min_para_size,
+                filter_repeated_text=filter_repeated_text_sidebar, # Use sidebar value
+                line_gap_threshold=0.5, # Pass tuning parameters
+                para_gap_threshold=1.5,
+                min_font_change_for_heading=0.15
+            )
             
-            # Route to appropriate converter
             if conversion == "PDF → Structured HTML":
                 output_bytes = structured_to_html(parsed_content, embed_pdf=embed_pdf, pdf_bytes=raw_bytes if embed_pdf else None)
                 ext, mime = ".html", "text/html"
@@ -918,7 +817,6 @@ def process_single_file(uploaded_file_obj):
                 raise ValueError("Invalid conversion path for PDF.")
                 
         elif file_ext == ".html":
-            # Route HTML inputs
             if conversion == "HTML → Plain Text":
                 output_bytes = html_to_text_bytes(raw_bytes)
                 ext, mime = ".txt", "text/plain"
@@ -930,13 +828,11 @@ def process_single_file(uploaded_file_obj):
         else:
             raise ValueError(f"Unsupported file type: {file_ext}")
             
-        # Success: Prepare result package
         output_name = os.path.splitext(file_name)[0] + "_converted" + ext
         result_entry.update({"out_bytes": output_bytes, "out_name": output_name, "mime": mime})
         return result_entry
         
     except Exception as e:
-        # Failure: Capture error
         result_entry["error"] = str(e)
         return result_entry
 
@@ -964,14 +860,14 @@ with ThreadPoolExecutor(max_workers=workers) as executor:
         try:
             result = future.result()
             if "error" in result:
-                errors_occurred.append(result) # Append the dict for full context
+                errors_occurred.append(result) 
                 log_area.error(f"❌ **{result['name']}**: {result['error']}")
             else:
                 results_for_zip.append(result)
                 out_size_kb = len(result['out_bytes']) / 1024
                 log_area.success(f"✅ **{result['name']}** → {result['out_name']} ({out_size_kb:.1f} KB)")
-        except Exception as exc: # FIX: Changed to catch specific Exception and assign it
-            errors_occurred.append({"name": file_name_processed, "error": f"Unhandled exception: {exc}"})
+        except Exception as exc: 
+            errors_occurred.append({"name": file_name_processed, "error": f"Unhandled exception during conversion: {exc}"})
             log_area.error(f"❌ **{file_name_processed}**: Critical error - {exc}")
 
 # Final Status Update
@@ -986,12 +882,10 @@ st.markdown("---")
 if results_for_zip:
     st.header("📥 Download Results")
     
-    # Tabbed interface for previews if multiple files, otherwise direct view
     if len(results_for_zip) > 1:
         tabs = st.tabs([res['name'] for res in results_for_zip])
         iterable = zip(tabs, results_for_zip)
     else:
-        # Single item, use a dummy container to make loop generic
         iterable = [(st.container(), results_for_zip[0])]
 
     for container, res in iterable:
@@ -1000,7 +894,6 @@ if results_for_zip:
             with col1:
                 st.subheader(res['out_name'])
             with col2:
-                # Prominent download button for each file
                 st.download_button(
                     label=f"⬇️ Download {res['out_name']}",
                     data=res["out_bytes"],
@@ -1011,13 +904,11 @@ if results_for_zip:
                     type="primary"
                 )
 
-            # Smart Preview
             if res["mime"].startswith("text/"):
                 try:
                     preview_text = res["out_bytes"].decode("utf-8", errors="replace")
                     if res["mime"] == "text/html":
                         with st.expander("👁️ Preview HTML (Rendered)", expanded=False):
-                            # Sandboxed HTML preview
                             st.components.v1.html(preview_text[:500000], height=400, scrolling=True)
                         with st.expander("📄 View HTML Source Code", expanded=False):
                              st.code(preview_text[:10000], language="html")
@@ -1031,7 +922,6 @@ if results_for_zip:
             
             st.divider()
 
-    # Bulk ZIP Download
     if len(results_for_zip) > 1:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1049,7 +939,6 @@ if results_for_zip:
         )
 
 elif not errors_occurred:
-    # Should only happen if list was empty initially but passed check
     st.warning("No results to display.")
 
 st.markdown("---")
