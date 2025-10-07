@@ -628,7 +628,72 @@ with ThreadPoolExecutor(max_workers=workers) as executor:
         try:
             result = future.result()
             if "error" in result:
-                # Corrected line: You need to call .append() and provide an argument
-                errors_occurred.append(result["error"]) # Assuming result["error"] contains the error details
-        except Exception as e: # It's good practice to catch exceptions from future.result() as well
-            errors_occurred.append(f"Error processing {file_name_processed}: {e}")
+                errors_occurred.append(result)
+                conversion_log.write(f"❌ Failed to convert '{result['name']}': {result['error']}")
+            else:
+                results_for_zip.append(result)
+                conversion_log.write(f"✅ Converted '{result['name']}' to '{result['out_name']}' ({len(result['out_bytes']):,} bytes)")
+        except Exception as exc:
+            errors_occurred.append({"name": file_name_processed, "error": f"Unhandled exception during processing: {exc}"})
+            conversion_log.write(f"❌ Failed to convert '{file_name_processed}': Unhandled error: {exc}")
+
+if errors_occurred:
+    status_message.error(f"Conversion completed with {len(errors_occurred)} error(s). Please check the log above.")
+else:
+    status_message.success("All files converted successfully!")
+
+# Display results and download options
+if results_for_zip:
+    st.markdown("---")
+    st.markdown("### Download Converted Files")
+    
+    # Create columns for individual downloads
+    num_cols = min(len(results_for_zip), 3) # Max 3 columns
+    cols = st.columns(num_cols)
+    
+    for i, res in enumerate(results_for_zip):
+        with cols[i % num_cols]:
+            st.markdown(f"**{res['out_name']}**")
+            
+            # Preview for text-based outputs
+            if res["mime"].startswith("text/plain"):
+                preview_text = res["out_bytes"].decode("utf-8", errors="replace")
+                st.text_area(f"Preview (first 2000 chars)", preview_text[:2000], height=180, key=f"preview_txt_{i}")
+            elif res["mime"].startswith("text/html"):
+                # HTML preview, limited to avoid browser/memory issues with huge HTML
+                # Streamlit's html component is sandboxed, so external links won't work.
+                try:
+                    st.components.v1.html(res["out_bytes"].decode("utf-8", errors="replace")[:200000], height=300, scrolling=True)
+                except Exception:
+                    st.write("*(HTML preview failed or is too large. Download instead.)*")
+            else:
+                st.write(f"*(No preview for {res['mime']})*")
+                
+            st.download_button(
+                label="Download",
+                data=res["out_bytes"],
+                file_name=res["out_name"],
+                mime=res["mime"],
+                key=f"download_btn_{i}"
+            )
+
+    # Offer a single ZIP download for all successfully converted files
+    st.markdown("---")
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for res in results_for_zip:
+            zf.writestr(res["out_name"], res["out_bytes"])
+    zip_buffer.seek(0)
+    
+    st.download_button(
+        label="⬇️ Download ALL Converted Files as ZIP",
+        data=zip_buffer.read(),
+        file_name="converted_structured_documents.zip",
+        mime="application/zip"
+    )
+
+elif not errors_occurred:
+    st.info("No files were successfully converted.")
+
+st.markdown("---")
+st.caption("Developed with PyMuPDF, pdfplumber, BeautifulSoup, and python-docx. Version 1.1")
