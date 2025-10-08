@@ -1,4 +1,6 @@
 streamlit 
-opencv-python
-pillow
-numpy
+pymupdf 
+pdfplumber 
+python-docx 
+beautifulsoup4 
+pandas
