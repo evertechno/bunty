@@ -1,229 +1,451 @@
-# streamlit_video_to_gif.py
-import streamlit as st
-import cv2
-import numpy as np
-from PIL import Image
+"""
+streamlit_converter_structured.py
+
+Streamlit Multi-format Converter — Structured, "as-is" output.
+Heuristics used:
+ - PyMuPDF (fitz) to read text blocks / spans with font sizes -> detect headings vs paragraphs
+ - pdfplumber to detect tabular data -> produce <table> and docx tables
+ - BeautifulSoup for HTML->Text/Word conversions
+ - python-docx to create Word (.docx) with headings, paragraphs, lists, tables
+
+Notes:
+ - This targets digital PDFs (embedded text). No OCR is performed.
+ - Heuristics (font-size thresholds, list detection) can be tuned in the UI.
+"""
 import io
-import base64
-import tempfile
 import os
-from typing import List, Tuple
+import zipfile
+import base64
+from typing import List, Tuple, Dict, Any
 
-st.set_page_config(page_title="Video → Email-compatible GIF", layout="centered")
+import streamlit as st
+import fitz  # PyMuPDF
+import pdfplumber
+from bs4 import BeautifulSoup
+from docx import Document
+from docx.shared import Pt
+import pandas as pd
+import html
+import re
 
-st.title("🎥 ➜ GIF (email-ready) — Streamlit")
-st.write(
-    "Upload a short video and convert it to an optimized GIF suitable for embedding in emails. "
-    "This app avoids external ffmpeg and uses OpenCV + Pillow."
-)
+# -----------------------------
+# Utility / Heuristic Functions
+# -----------------------------
 
-# --- Helper functions ---
-def save_temp_video_file(uploaded_file) -> str:
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1])
-    tmp.write(uploaded_file.getbuffer())
-    tmp.flush()
-    tmp.close()
-    return tmp.name
+BULLET_CHARS = r"^[\u2022\u2023\u25E6\-\*\•\–\—]\s+|^\d+[\.\)]\s+"
 
-def read_video_metadata(path: str) -> Tuple[float, int, int]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open video file.")
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    cap.release()
-    duration = frame_count / fps if fps else 0
-    return duration, fps, (width, height)
+def sanitize_text(t: str) -> str:
+    return t.replace('\r', '').rstrip()
 
-def video_to_frames(path: str, start: float, end: float, target_fps: float, max_width: int) -> List[Image.Image]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise RuntimeError("Could not open video file.")
-    orig_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = frame_count / orig_fps if orig_fps else 0
+def is_bullet_line(text: str) -> bool:
+    return bool(re.match(BULLET_CHARS, text.strip()))
 
-    # clamp
-    start = max(0.0, min(start, duration))
-    end = max(start, min(end, duration))
-    if end <= start:
-        end = min(start + 5.0, duration)  # fallback
+def normalize_whitespace(s: str) -> str:
+    return re.sub(r'\s+\n', '\n', re.sub(r'\n\s+', '\n', s)).strip()
 
-    # compute frame indices to capture
-    start_frame = int(start * orig_fps)
-    end_frame = int(end * orig_fps)
+def choose_heading_levels(unique_sizes: List[float]) -> Dict[float, int]:
+    """
+    Map font sizes -> heading levels (1..4) heuristically.
+    Biggest -> h1, next -> h2, etc. If many sizes, map top ones to headings.
+    """
+    sizes = sorted(set(unique_sizes), reverse=True)
+    mapping = {}
+    # Map up to 4 distinct sizes to heading levels
+    top = sizes[:4]
+    for idx, s in enumerate(top):
+        mapping[s] = idx + 1  # 1..4
+    # any other sizes map to 0 (normal paragraph)
+    return mapping
 
-    # step to achieve target_fps
-    step = max(1, int(round(orig_fps / target_fps))) if target_fps > 0 else 1
+# -----------------------------
+# PDF Parsing (structured)
+# -----------------------------
 
-    frames = []
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-    frame_idx = start_frame
-    while frame_idx <= end_frame:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if (frame_idx - start_frame) % step == 0:
-            # convert BGR -> RGB
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            pil = Image.fromarray(rgb)
-            # resize preserving aspect ratio if needed
-            if max_width and pil.width > max_width:
-                ratio = max_width / pil.width
-                new_h = int(pil.height * ratio)
-                pil = pil.resize((max_width, new_h), Image.LANCZOS)
-            frames.append(pil.convert("RGBA"))
-        frame_idx += 1
+def parse_pdf_structured(pdf_bytes: bytes, min_heading_ratio: float = 1.12) -> Dict[str, Any]:
+    """
+    Parse PDF into a structured intermediate representation:
+    {
+        "pages": [
+            {
+                "elements": [ {"type":"heading"/"para"/"list_item"/"table", "text":..., "level":n, ...}, ... ],
+                "tables": [ { "rows":[...], "bbox":...}, ... ]
+            }, ...
+        ],
+        "fontsizes": [list of sizes found]
+    }
+    Heuristics:
+     - Uses PyMuPDF blocks & spans for text and font sizes.
+     - Uses pdfplumber for table detection.
+     - Identify bullets via regex or lines starting with bullet/number patterns.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    pages_out = []
+    all_sizes = []
+    # Gather font sizes across doc (from fits get_text("dict"))
+    for p in range(len(doc)):
+        page = doc.load_page(p)
+        d = page.get_text("dict")
+        for block in d.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    sz = round(span.get("size", 0), 2)
+                    if sz > 0:
+                        all_sizes.append(sz)
 
-    cap.release()
-    return frames
+    if not all_sizes:
+        unique_sizes = [12.0]
+    else:
+        unique_sizes = sorted(set(all_sizes), reverse=True)
 
-def frames_to_gif_bytes(frames: List[Image.Image], duration_ms: int, loop: int = 0, optimize: bool = True) -> bytes:
-    if not frames:
-        raise ValueError("No frames to encode.")
-    # Convert frames to P mode (palette) for smaller GIFs, maintain transparency handling
-    first, rest = frames[0].convert("RGBA"), [f.convert("RGBA") for f in frames[1:]]
-    # Convert RGBA -> P using adaptive palette, keep preserve transparency by using a white background for quantization
-    # To reduce artifacts, paste onto background then quantize
-    bg = Image.new("RGBA", first.size, (255, 255, 255, 255))
-    composed_frames = []
-    for fr in [first] + rest:
-        tmp = Image.alpha_composite(bg, fr).convert("RGB")  # flatten
-        composed_frames.append(tmp)
+    # create mapping for headings
+    font_to_heading = choose_heading_levels(unique_sizes)
 
-    # Save to BytesIO via Pillow
-    bio = io.BytesIO()
-    # duration_ms per frame
-    composed_frames[0].save(
-        bio,
-        format="GIF",
-        save_all=True,
-        append_images=composed_frames[1:],
-        duration=duration_ms,
-        loop=loop,
-        optimize=optimize,
-        disposal=2,
-    )
-    bio.seek(0)
-    return bio.read()
+    # threshold to decide heading vs paragraph: if span size >= (largest * min_heading_ratio) mark as heading
+    max_size = max(unique_sizes) if unique_sizes else 12.0
+    heading_threshold = max_size / min_heading_ratio  # smaller denominator -> more headings
 
-def make_data_uri(gif_bytes: bytes) -> str:
-    b64 = base64.b64encode(gif_bytes).decode("ascii")
-    return f"data:image/gif;base64,{b64}"
+    # Now parse each page into elements
+    for p in range(len(doc)):
+        page = doc.load_page(p)
+        d = page.get_text("dict")
+        elements = []
+        # first detect tables with pdfplumber on this page
+        tables_page = []
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as ppdf:
+                page_pl = ppdf.pages[p]
+                # tables may be empty; this returns list of lists or empty
+                extracted_tables = page_pl.extract_tables()
+                for t in extracted_tables:
+                    if t and any(any(cell for cell in row if cell not in (None, "")) for row in t):
+                        tables_page.append({"rows": t})
+        except Exception:
+            tables_page = []
 
-# --- UI ---
+        # Add tables as elements (this keeps order approximate — we append tables at end of page parsing
+        # because exact vertical ordering would require bbox comparison between pdfplumber and fitz)
+        # For text blocks:
+        for block in d.get("blocks", []):
+            if block.get("type") != 0:
+                # skip images/other (user wanted no OCR)
+                continue
+            # combine lines inside a block; preserve line breaks
+            block_lines = []
+            for line in block.get("lines", []):
+                line_text = ""
+                spans = line.get("spans", [])
+                # For each span, collect text; we also track max span size to infer heading
+                max_span_sz = 0.0
+                for span in spans:
+                    stxt = span.get("text", "")
+                    if stxt:
+                        line_text += stxt
+                    sz = span.get("size", 0)
+                    if sz and sz > max_span_sz:
+                        max_span_sz = sz
+                if line_text.strip():
+                    block_lines.append((line_text.strip(), max_span_sz))
+            # Now process block_lines
+            # If block contains many lines that look like bullets, mark list items
+            for ln, sz in block_lines:
+                ln_clean = ln.strip()
+                if is_bullet_line(ln_clean):
+                    # list item
+                    elements.append({"type": "list_item", "text": ln_clean, "size": sz})
+                else:
+                    # heading detection via size or mapping
+                    mapped_level = font_to_heading.get(round(sz, 2), 0)
+                    if (sz >= heading_threshold) or mapped_level:
+                        level = mapped_level if mapped_level else 2
+                        elements.append({"type": "heading", "text": ln_clean, "level": level, "size": sz})
+                    else:
+                        elements.append({"type": "para", "text": ln_clean, "size": sz})
+        # append detected tables (best-effort)
+        for t in tables_page:
+            elements.append({"type": "table", "rows": t["rows"]})
 
-uploaded = st.file_uploader("Upload video (mp4, mov, avi, webm...) — keep under 30 MB for best results", type=["mp4","mov","avi","webm","mkv"], accept_multiple_files=False)
+        pages_out.append({"page_number": p + 1, "elements": elements})
 
-if uploaded is None:
-    st.info("Upload a short video to begin. Recommended: <= 10 seconds, <= 600×? width for email compatibility.")
+    return {"pages": pages_out, "fontsizes": unique_sizes}
+
+
+# -----------------------------
+# Converters: Intermediate -> HTML / DOCX / TEXT
+# -----------------------------
+
+def structured_to_html(parsed: dict, embed_pdf: bool = False, pdf_bytes: bytes = None) -> bytes:
+    parts = ['<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font-family:Arial,Helvetica,sans-serif;line-height:1.4;padding:16px}pre{white-space:pre-wrap;}table{border-collapse:collapse;margin:8px 0}td,th{border:1px solid #ccc;padding:6px}</style></head><body>']
+    for page in parsed["pages"]:
+        parts.append(f'<div class="page" data-page="{page["page_number"]}" style="page-break-after:always;">')
+        for el in page["elements"]:
+            if el["type"] == "heading":
+                lvl = min(max(int(el.get("level", 2)), 1), 6)
+                text = html.escape(el["text"])
+                parts.append(f"<h{lvl}>{text}</h{lvl}>")
+            elif el["type"] == "para":
+                text = html.escape(el["text"])
+                parts.append(f"<p>{text}</p>")
+            elif el["type"] == "list_item":
+                # we'll build simple lists: consecutive list_items -> ul/ol
+                parts.append(f"<li>{html.escape(el['text'])}</li>")
+            elif el["type"] == "table":
+                rows = el["rows"]
+                parts.append("<table>")
+                for r in rows:
+                    parts.append("<tr>" + "".join(f"<td>{html.escape(str(c) if c is not None else '')}</td>" for c in r) + "</tr>")
+                parts.append("</table>")
+        parts.append("</div>")
+    # post-process to wrap consecutive <li> into <ul>
+    html_text = "\n".join(parts) + "</body></html>"
+    # wrap <li> sequences into <ul>
+    html_text = re.sub(r'(?:</div>\s*)?(?:\s*<li>.*?</li>\s*)+', lambda m: "<ul>" + "".join(re.findall(r'<li>.*?</li>', m.group(0))) + "</ul>", html_text, flags=re.S)
+    # embed original PDF optionally
+    if embed_pdf and pdf_bytes:
+        b64 = base64.b64encode(pdf_bytes).decode('ascii')
+        embed_snip = f'<hr/><h2>Original PDF (embedded)</h2><embed src="data:application/pdf;base64,{b64}" width="100%" height="600px"></embed>'
+        html_text = html_text.replace("</body></html>", embed_snip + "</body></html>")
+    return html_text.encode("utf-8")
+
+
+def structured_to_text(parsed: dict) -> bytes:
+    out_lines = []
+    for page in parsed["pages"]:
+        out_lines.append(f"--- PAGE {page['page_number']} ---")
+        for el in page["elements"]:
+            if el["type"] == "heading":
+                out_lines.append(el["text"].upper())
+            elif el["type"] == "para":
+                out_lines.append(el["text"])
+            elif el["type"] == "list_item":
+                out_lines.append(f"- {el['text']}")
+            elif el["type"] == "table":
+                # simple CSV-ish representation
+                rows = el["rows"]
+                for r in rows:
+                    out_lines.append("\t".join([str(c) if c is not None else "" for c in r]))
+    joined = "\n".join(out_lines)
+    return joined.encode("utf-8")
+
+
+def structured_to_docx(parsed: dict) -> bytes:
+    doc = Document()
+    # default font size mapping
+    style = doc.styles['Normal']
+    style.font.name = 'Arial'
+    style.font.size = Pt(11)
+    for page in parsed["pages"]:
+        # optional page header
+        doc.add_paragraph(f"--- Page {page['page_number']} ---").style = doc.styles['Normal']
+        last_was_list = False
+        for el in page["elements"]:
+            if el["type"] == "heading":
+                lvl = min(max(int(el.get("level", 2)), 1), 4)
+                # use add_heading for semantic headings
+                doc.add_heading(el["text"], level=lvl if lvl <= 4 else 4)
+                last_was_list = False
+            elif el["type"] == "para":
+                doc.add_paragraph(el["text"])
+                last_was_list = False
+            elif el["type"] == "list_item":
+                # docx doesn't have direct list API in python-docx; emulate with paragraph style 'List Bullet'
+                p = doc.add_paragraph(el["text"])
+                p.style = 'List Bullet'
+                last_was_list = True
+            elif el["type"] == "table":
+                rows = el["rows"]
+                if not rows:
+                    continue
+                # create table with n rows and n cols
+                ncols = max(len(r) for r in rows)
+                tbl = doc.add_table(rows=0, cols=ncols)
+                tbl.style = 'Table Grid'
+                for r in rows:
+                    row_cells = tbl.add_row().cells
+                    for i in range(ncols):
+                        cell_text = str(r[i]) if i < len(r) and r[i] is not None else ""
+                        row_cells[i].text = cell_text
+                last_was_list = False
+        # add a page break
+        doc.add_page_break()
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+# -----------------------------
+# HTML -> Text / DOCX
+# -----------------------------
+
+def html_to_text_bytes(html_bytes: bytes) -> bytes:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    text = soup.get_text(separator="\n")
+    return text.encode("utf-8")
+
+def html_to_docx_bytes(html_bytes: bytes) -> bytes:
+    soup = BeautifulSoup(html_bytes, "html.parser")
+    doc = Document()
+    for el in soup.body.descendants:
+        if el.name and el.name.startswith("h") and el.get_text(strip=True):
+            level = int(el.name[1]) if len(el.name) > 1 and el.name[1].isdigit() else 2
+            doc.add_heading(el.get_text(strip=True), level=min(level, 4))
+        elif el.name == "p" and el.get_text(strip=True):
+            doc.add_paragraph(el.get_text("\n", strip=True))
+        elif el.name in ("ul", "ol"):
+            for li in el.find_all("li"):
+                p = doc.add_paragraph(li.get_text(strip=True))
+                p.style = 'List Bullet' if el.name == "ul" else 'List Number'
+        elif el.name == "table":
+            rows = []
+            for r in el.find_all("tr"):
+                cols = [c.get_text(strip=True) for c in r.find_all(["th", "td"])]
+                rows.append(cols)
+            if rows:
+                ncols = max(len(r) for r in rows)
+                tbl = doc.add_table(rows=0, cols=ncols)
+                tbl.style = 'Table Grid'
+                for r in rows:
+                    cells = tbl.add_row().cells
+                    for i in range(ncols):
+                        cells[i].text = r[i] if i < len(r) else ""
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
+# -----------------------------
+# Streamlit App UI
+# -----------------------------
+
+st.set_page_config(page_title="Legacy Converter — Preserve Structure", layout="wide", page_icon="📚")
+st.title("📚 Legacy Converter — Preserve structure, create a legacy")
+
+st.markdown("""
+This app tries to **preserve structure** during conversions:
+- Headings (detected via font size)
+- Paragraphs (text blocks)
+- Lists (bullets / numbered)
+- Tables (via pdfplumber)
+It uses heuristics — tune thresholds from the sidebar for better results on specific documents.
+""")
+
+with st.sidebar:
+    st.header("Conversion options")
+    conversion = st.selectbox("Conversion", [
+        "PDF → Structured HTML",
+        "PDF → Word (.docx)",
+        "PDF → Plain Text",
+        "HTML → Word (.docx)",
+        "HTML → Plain Text"
+    ])
+    workers = st.number_input("Parallel workers (bulk)", min_value=1, max_value=8, value=3)
+    embed_pdf = st.checkbox("Embed original PDF into HTML output (only for HTML outputs)", value=False)
+    # tuning
+    st.markdown("### Heuristics tuning")
+    heading_ratio = st.slider("Heading size sensitivity (lower = more headings)", min_value=1.05, max_value=1.5, value=1.12, step=0.01)
+    st.markdown("Tip: reduce heading sensitivity if your headings are not being detected; increase to reduce false headings.")
+
+uploaded = st.file_uploader("Upload PDF(s) or HTML(s) — digital PDFs only (no OCR).", type=["pdf", "html"], accept_multiple_files=True)
+
+if not uploaded:
+    st.info("Upload at least one file. This converter targets digital PDFs (embedded text) and HTML files.")
     st.stop()
 
-# Save to temp file (opencV requires a path)
-with st.spinner("Saving upload..."):
-    video_path = save_temp_video_file(uploaded)
+# Bulk processing
+st.markdown(f"Files queued: {len(uploaded)}")
+start = st.button("Create legacy — Convert now")
 
-try:
-    duration, orig_fps, (w, h) = read_video_metadata(video_path)
-except Exception as e:
-    st.error(f"Couldn't read video metadata: {e}")
-    os.unlink(video_path)
+if not start:
     st.stop()
 
-st.write(f"**Filename:** {uploaded.name} — **Duration:** {duration:.2f}s — **Resolution:** {w}×{h} — **FPS:** {orig_fps:.2f}")
+# Process files (parallelize best-effort)
+from concurrent.futures import ThreadPoolExecutor, as_completed
+results_for_zip = []
 
-# Controls: start/end, fps, width, max size
-col1, col2 = st.columns(2)
-with col1:
-    start_time = st.number_input("Start time (sec)", min_value=0.0, max_value=duration, value=0.0, step=0.5, format="%.2f")
-    end_time = st.number_input("End time (sec)", min_value=0.0, max_value=duration, value=min(5.0, duration), step=0.5, format="%.2f")
-with col2:
-    target_fps = st.select_slider("Target FPS (lower → smaller file)", options=[1,2,3,5,6,8,10,12,15], value=6)
-    max_width = st.selectbox("Max width (px) for GIF (email-friendly)", options=[320,400,480,600,800], index=0)
+def process_file(uploaded_file):
+    name = uploaded_file.name
+    raw = uploaded_file.read()
+    ext = os.path.splitext(name)[1].lower()
+    try:
+        if ext == ".pdf":
+            parsed = parse_pdf_structured(raw, min_heading_ratio=heading_ratio)
+            if conversion == "PDF → Structured HTML":
+                out_bytes = structured_to_html(parsed, embed_pdf=embed_pdf, pdf_bytes=raw if embed_pdf else None)
+                out_name = os.path.splitext(name)[0] + ".html"
+                mime = "text/html"
+            elif conversion == "PDF → Word (.docx)":
+                out_bytes = structured_to_docx(parsed)
+                out_name = os.path.splitext(name)[0] + ".docx"
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            elif conversion == "PDF → Plain Text":
+                out_bytes = structured_to_text(parsed)
+                out_name = os.path.splitext(name)[0] + ".txt"
+                mime = "text/plain"
+            else:
+                return {"name": name, "error": f"Conversion {conversion} not valid for PDF"}
+        elif ext == ".html":
+            if conversion == "HTML → Plain Text":
+                out_bytes = html_to_text_bytes(raw)
+                out_name = os.path.splitext(name)[0] + ".txt"
+                mime = "text/plain"
+            elif conversion == "HTML → Word (.docx)":
+                out_bytes = html_to_docx_bytes(raw)
+                out_name = os.path.splitext(name)[0] + ".docx"
+                mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            else:
+                return {"name": name, "error": f"Conversion {conversion} not valid for HTML"}
+        else:
+            return {"name": name, "error": "Unsupported file type"}
+        return {"name": name, "out_bytes": out_bytes, "out_name": out_name, "mime": mime}
+    except Exception as e:
+        return {"name": name, "error": str(e)}
 
-loop = st.checkbox("Loop GIF (set loop=0 for infinite)", value=True)
-loop_val = 0 if loop else 1
+progress = st.progress(0)
+status = st.empty()
+log = st.empty()
 
-duration_per_frame_ms = int(1000 / target_fps)
+with ThreadPoolExecutor(max_workers=workers) as exe:
+    futures = {exe.submit(process_file, f): f.name for f in uploaded}
+    done = 0
+    for fut in as_completed(futures):
+        done += 1
+        res = fut.result()
+        progress.progress(done / len(uploaded))
+        if res.get("error"):
+            log.write(f"✖ {res['name']} — {res['error']}")
+        else:
+            results_for_zip.append(res)
+            log.write(f"✔ {res['name']} → {res['out_name']} ({len(res['out_bytes']):,} bytes)")
+    status.success("Conversion jobs finished")
+
+# Show results and allow downloads; also create ZIP for bulk download
+if results_for_zip:
+    st.markdown("### Download converted files")
+    cols = st.columns(3)
+    for i, res in enumerate(results_for_zip):
+        col = cols[i % 3]
+        with col:
+            st.write(res["out_name"])
+            if res["mime"].startswith("text/"):
+                preview_text = res["out_bytes"].decode("utf-8", errors="replace")[:4000]
+                st.text_area(f"Preview — {res['out_name']}", preview_text, height=180)
+            elif res["mime"] == "text/html":
+                try:
+                    st.components.v1.html(res["out_bytes"].decode("utf-8", errors="replace")[:200000], height=300, scrolling=True)
+                except Exception:
+                    st.write("(HTML preview failed; download instead.)")
+            st.download_button("Download", data=res["out_bytes"], file_name=res["out_name"], mime=res["mime"])
+
+    # ZIP
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for r in results_for_zip:
+            zf.writestr(r["out_name"], r["out_bytes"])
+    zip_buf.seek(0)
+    st.download_button("Download ALL as ZIP", zip_buf.read(), file_name="converted_legacy.zip", mime="application/zip")
+else:
+    st.error("No successful conversions to download. Check logs above.")
 
 st.markdown("---")
-st.write("Advanced / safety")
-max_duration_allowed = st.slider("Maximum extracted duration (sec) — to keep GIF tiny", min_value=1, max_value=30, value=10)
-if (end_time - start_time) > max_duration_allowed:
-    st.warning(f"Selected clip is longer than {max_duration_allowed}s. It will be truncated to keep GIF size manageable.")
-    end_time = start_time + max_duration_allowed
-
-convert_button = st.button("Convert to GIF")
-
-if convert_button:
-    try:
-        with st.spinner("Extracting frames (OpenCV)..."):
-            frames = video_to_frames(video_path, start_time, end_time, target_fps, max_width)
-        if not frames:
-            st.error("No frames extracted. Try adjusting start/end or check video format.")
-        else:
-            st.success(f"Extracted {len(frames)} frames.")
-            with st.spinner("Encoding GIF (Pillow)..."):
-                gif_bytes = frames_to_gif_bytes(frames, duration_ms=duration_per_frame_ms, loop=loop_val, optimize=True)
-
-            gif_size_kb = len(gif_bytes) / 1024
-            st.write(f"### Result GIF — {gif_size_kb:.1f} KB")
-
-            # Preview
-            st.image(gif_bytes, format="GIF", caption="Preview GIF")
-
-            # Provide download button
-            st.download_button(
-                label="Download GIF",
-                data=gif_bytes,
-                file_name=os.path.splitext(uploaded.name)[0] + ".gif",
-                mime="image/gif"
-            )
-
-            # Data URI for embedding in HTML / iframe
-            data_uri = make_data_uri(gif_bytes)
-
-            st.markdown("#### Render inside HTML `img` (example)")
-            html_img = f"""<div>
-<img src="{data_uri}" alt="embedded gif" style="max-width:100%;height:auto;border:1px solid #ddd;border-radius:6px;" />
-</div>"""
-            st.components.v1.html(html_img, height=min(600, int(max_width * 0.8) + 80), scrolling=True)
-
-            st.markdown("#### Render inside an `iframe` (example)")
-            # iframe srcdoc with the same image
-            iframe_srcdoc = f"""
-<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>GIF in iframe</title>
-</head>
-<body style="margin:0;padding:10px;background:#f8f9fb;display:flex;align-items:center;justify-content:center;height:100%;">
-<img src="{data_uri}" alt="gif" style="max-width:100%;height:auto;" />
-</body>
-</html>
-"""
-           # Escape double quotes safely before embedding in f-string
-safe_srcdoc = iframe_srcdoc.replace('"', "&quot;")
-
-iframe_html = (
-    f'<iframe srcdoc="{safe_srcdoc}" '
-    f'style="width:100%;height:420px;border:1px solid #ddd;border-radius:6px;"></iframe>'
-)
-
-st.components.v1.html(iframe_html, height=420)
-
-
-    except Exception as e:
-        st.error(f"Conversion failed: {e}")
-    finally:
-        try:
-            os.unlink(video_path)
-        except Exception:
-            pass
-
-# show example: small fallback auto-convert for very small uploads
-st.caption("Tip: For email use, keep GIF short (3–7s), low fps (6–12), and ≤ 600px width.")
-
+st.info("This tool preserves structure using heuristics (font sizes, bullets, table detection). If a document has odd layout or complex multi-column formatting, tweak the 'Heading size sensitivity' slider or ask me to add per-document tuning rules.")
